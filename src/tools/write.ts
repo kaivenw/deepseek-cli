@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Tool } from "./types.js";
+import { makeDiff } from "./diff.js";
 
 export const writeTool: Tool = {
   name: "write_file",
@@ -35,12 +36,14 @@ export const writeTool: Tool = {
     const abs = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
 
     const existed = fs.existsSync(abs);
+    const previous = existed ? fs.readFileSync(abs, "utf8") : "";
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, "utf8");
 
     return {
       content: `${existed ? "Overwrote" : "Created"} ${rel} (${content.split("\n").length} lines).`,
       summary: `${existed ? "Overwrote" : "Created"} ${rel}`,
+      display: existed ? makeDiff(rel, previous, content) : undefined,
     };
   },
 };

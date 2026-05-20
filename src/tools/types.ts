@@ -1,5 +1,14 @@
+import type { ThinkingMode } from "../config.js";
+import type { TodoStore } from "../todo.js";
+
 export interface ToolContext {
   cwd: string;
+  /** Change how the assistant's reasoning trace is displayed (set by the agent). */
+  setThinkingMode?(mode: ThinkingMode): void;
+  /** Read the current reasoning-display mode. */
+  getThinkingMode?(): ThinkingMode;
+  /** Shared task list used by todo_read/todo_write. */
+  todoStore?: TodoStore;
 }
 
 export interface ToolResult {
@@ -7,6 +16,8 @@ export interface ToolResult {
   content: string;
   /** Short human-readable line shown in the terminal. */
   summary?: string;
+  /** Optional multi-line block (e.g. a diff) the terminal renders under the summary. */
+  display?: string;
   isError?: boolean;
 }
 

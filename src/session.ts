@@ -24,6 +24,7 @@ export function loadSession(cwd: string): SessionData | null {
       totalUsage: data.totalUsage || { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       contextSummary: typeof data.contextSummary === "string" ? data.contextSummary : null,
       compressedAt: typeof data.compressedAt === "string" ? data.compressedAt : null,
+      todos: Array.isArray(data.todos) ? data.todos : [],
     };
   } catch {
     return null;

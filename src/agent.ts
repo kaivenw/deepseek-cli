@@ -1,15 +1,57 @@
 import { execSync } from "node:child_process";
+import readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
 import { DeepSeekClient, type ChatMessage, type ListedModel, type ToolCall, type Usage } from "./client.js";
 import { getTool, toOpenAITools, type ToolContext } from "./tools/index.js";
-import { findModel, type Config } from "./config.js";
+import { findModel, saveConfig, type Config, type ThinkingMode } from "./config.js";
 import type { PermissionManager } from "./permissions.js";
 import { formatProjectMemoryForPrompt } from "./project.js";
 import { ui, chalk, Spinner } from "./ui/render.js";
+import { TodoStore, type TodoItem } from "./todo.js";
+import { runHooks } from "./hooks.js";
 
 const MAX_TOOL_ITERATIONS = 25;
+const FILE_MENTION_RE = /(^|\s)@([^\s@]+)/g;
+const MAX_MENTION_CHARS = 50_000;
+
+/** Expand `@path` mentions in user input by appending the referenced file contents. */
+function expandFileMentions(input: string, cwd: string): string {
+  const seen = new Set<string>();
+  const blocks: string[] = [];
+  let match: RegExpExecArray | null;
+  FILE_MENTION_RE.lastIndex = 0;
+  while ((match = FILE_MENTION_RE.exec(input)) !== null) {
+    const rel = match[2];
+    if (seen.has(rel)) continue;
+    const abs = path.isAbsolute(rel) ? rel : path.join(cwd, rel);
+    try {
+      if (!fs.statSync(abs).isFile()) continue;
+      let content = fs.readFileSync(abs, "utf8");
+      if (content.length > MAX_MENTION_CHARS) content = content.slice(0, MAX_MENTION_CHARS) + "\n…[truncated]";
+      seen.add(rel);
+      blocks.push(`### @${rel}\n\`\`\`\n${content}\n\`\`\``);
+    } catch {
+      // Not a readable file — leave the @token in place as plain text.
+    }
+  }
+  if (blocks.length === 0) return input;
+  return `${input}\n\n--- Referenced files ---\n${blocks.join("\n\n")}`;
+}
+const COLLAPSED_REASONING_LINES = 6;
 const AUTO_COMPRESS_ESTIMATED_TOKEN_LIMIT = 48_000;
 const AUTO_COMPRESS_MESSAGE_LIMIT = 80;
 const COMPRESSION_INPUT_CHAR_LIMIT = 160_000;
+
+interface KeypressKey {
+  name?: string;
+  ctrl?: boolean;
+}
+
+type RawInput = NodeJS.ReadStream & {
+  isRaw?: boolean;
+  setRawMode?: (mode: boolean) => void;
+};
 
 const COMPRESSION_SYSTEM_PROMPT = [
   "You are compressing the context of an agentic coding CLI conversation.",
@@ -126,6 +168,16 @@ function estimateTokensFromText(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+function renderHookRuns(results: ReturnType<typeof runHooks>): string {
+  return results
+    .map((result) => {
+      const state = result.ok ? "ok" : result.blocking ? "blocked" : "failed";
+      const output = result.output ? `\n${truncateText(result.output, 4_000)}` : "";
+      return `hook ${state}: ${result.command}${output}`;
+    })
+    .join("\n");
+}
+
 function getGitContext(cwd: string): string | null {
   try {
     const root = execSync("git rev-parse --show-toplevel", {
@@ -170,8 +222,10 @@ function systemPrompt(cwd: string, contextSummary: string | null = null): string
     "Use the provided tools to inspect files, search code, edit files, and run shell commands.",
     "Before editing, inspect the relevant files. Keep changes focused and explain what changed.",
     "Prefer search_text over broad file reads. Never assume file contents you have not read.",
+    "Use todo_write to track multi-step tasks: create a short list before substantial work, keep exactly one item in_progress, and mark items completed as you finish them.",
     "",
     "The local CLI will ask the user before running shell commands or writing files unless they start it with --yes.",
+    "If the user asks to show or hide your reasoning/thinking (e.g. \"关闭思考\"/\"显示思考\"/\"hide your thinking\"), call the set_thinking tool.",
     "",
     `Working directory: ${cwd}`,
     `Today's date: ${today}`,
@@ -192,6 +246,7 @@ export interface SessionData {
   totalUsage: Usage;
   contextSummary?: string | null;
   compressedAt?: string | null;
+  todos?: TodoItem[];
 }
 
 export interface CompressResult {
@@ -210,6 +265,7 @@ export class Agent {
   private client: DeepSeekClient;
   private contextSummary: string | null = null;
   private compressedAt: string | null = null;
+  private todoStore = new TodoStore();
   totalUsage: Usage;
 
   constructor(
@@ -218,6 +274,19 @@ export class Agent {
     private ctx: ToolContext,
   ) {
     this.client = new DeepSeekClient(config);
+    // Let tools (e.g. set_thinking) change session settings and persist them.
+    const toolCtx: ToolContext = { ...ctx };
+    toolCtx.setThinkingMode = (mode: ThinkingMode) => {
+      this.config.thinkingMode = mode;
+      try {
+        saveConfig(this.config);
+      } catch {
+        // Persisting is best-effort; the in-session change still applies.
+      }
+    };
+    toolCtx.getThinkingMode = () => this.config.thinkingMode ?? "off";
+    toolCtx.todoStore = this.todoStore;
+    this.ctx = toolCtx;
     this.messages = [];
     this.refreshSystemPrompt();
     this.totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -229,6 +298,14 @@ export class Agent {
 
   getModel(): string {
     return this.config.model;
+  }
+
+  setThinkingMode(mode: ThinkingMode): void {
+    this.config.thinkingMode = mode;
+  }
+
+  getThinkingMode(): ThinkingMode {
+    return this.config.thinkingMode ?? "off";
   }
 
   getCwd(): string {
@@ -245,6 +322,11 @@ export class Agent {
       { role: "system", content: systemPrompt(this.ctx.cwd, this.contextSummary) },
       ...nonSystemMessages,
     ];
+  }
+
+  /** Rebuild the system prompt in place (e.g. after DEEPSEEK.md changes), keeping history. */
+  reloadProjectContext(): void {
+    this.refreshSystemPrompt();
   }
 
   /** Drop conversation history and compressed context, but keep the system prompt. */
@@ -267,6 +349,7 @@ export class Agent {
       totalUsage: { ...this.totalUsage },
       contextSummary: this.contextSummary,
       compressedAt: this.compressedAt,
+      todos: this.todoStore.list(),
     };
   }
 
@@ -275,6 +358,7 @@ export class Agent {
     // Keep the system prompt fresh but restore the rest.
     this.contextSummary = data.contextSummary ?? null;
     this.compressedAt = data.compressedAt ?? null;
+    this.todoStore.replace(Array.isArray(data.todos) ? data.todos : []);
     this.messages = [
       { role: "system", content: systemPrompt(this.ctx.cwd, this.contextSummary) },
       ...data.messages.filter((m) => roleOf(m) !== "system"),
@@ -284,6 +368,10 @@ export class Agent {
 
   getContextSummary(): string | null {
     return this.contextSummary;
+  }
+
+  getTodos(): string {
+    return this.todoStore.formatForModel();
   }
 
   private estimatedContextTokens(extraUserInput = ""): number {
@@ -367,9 +455,45 @@ export class Agent {
     }
   }
 
+  private listenForGenerationAbort(controller: AbortController): () => void {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) return () => undefined;
+
+    const input = process.stdin as RawInput;
+    const wasRaw = Boolean(input.isRaw);
+    const onKeypress = (_str: string, key: KeypressKey = {}) => {
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        controller.abort();
+      }
+    };
+
+    readline.emitKeypressEvents(input);
+    input.setRawMode?.(true);
+    input.on("keypress", onKeypress);
+    input.resume();
+
+    return () => {
+      input.off("keypress", onKeypress);
+      if (!wasRaw) input.setRawMode?.(false);
+    };
+  }
+
+  async runIsolated(userInput: string): Promise<void> {
+    const savedMessages = this.messages;
+    this.messages = [];
+    this.refreshSystemPrompt();
+    try {
+      await this.run(userInput);
+    } finally {
+      this.messages = savedMessages;
+      this.refreshSystemPrompt();
+    }
+  }
+
   async run(userInput: string): Promise<void> {
-    if (this.shouldAutoCompress(userInput)) {
-      ui.warn(`Context is large (~${this.estimatedContextTokens(userInput).toLocaleString()} estimated tokens); compressing before continuing.`);
+    const input = expandFileMentions(userInput, this.ctx.cwd);
+
+    if (this.shouldAutoCompress(input)) {
+      ui.warn(`Context is large (~${this.estimatedContextTokens(input).toLocaleString()} estimated tokens); compressing before continuing.`);
       try {
         const result = await this.compressContext("auto");
         if (result.compressed) {
@@ -382,7 +506,7 @@ export class Agent {
       }
     }
 
-    this.messages.push({ role: "user", content: userInput });
+    this.messages.push({ role: "user", content: input });
 
     const supportsTools = findModel(this.config.model)?.supportsTools !== false;
     const tools = supportsTools ? toOpenAITools() : [];
@@ -390,28 +514,69 @@ export class Agent {
     for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
       let textStarted = false;
       let reasoningStarted = false;
+      const thinkingMode = this.config.thinkingMode ?? "off";
+      let reasoningLines = 1;
+      let reasoningCut = false;
       const spinner = new Spinner("thinking…");
       spinner.start();
 
-      const turn = await this.client.stream(this.messages, tools, this.config.model, {
-        onReasoning: (delta) => {
-          if (!reasoningStarted) {
-            spinner.stop();
-            process.stdout.write(chalk.dim.italic("\n  [thinking] "));
-            reasoningStarted = true;
-          }
+      // Reasoning is always captured for the API contract (see client.stream);
+      // these callbacks only control how/whether it is displayed.
+      const printReasoning = (delta: string) => {
+        if (!reasoningStarted) {
+          spinner.stop();
+          process.stdout.write(chalk.dim.italic("\n  [thinking] "));
+          reasoningStarted = true;
+        }
+        if (thinkingMode === "full") {
           process.stdout.write(chalk.dim.italic(delta.replace(/\n/g, "\n  ")));
-        },
-        onText: (delta) => {
-          if (!textStarted) {
-            spinner.stop();
-            if (reasoningStarted) process.stdout.write("\n");
-            ui.assistantLabel();
-            textStarted = true;
+          return;
+        }
+        // collapsed: show only the first few lines, then stop printing the rest.
+        if (reasoningCut) return;
+        const segments = delta.split("\n");
+        for (let i = 0; i < segments.length; i++) {
+          if (i > 0) {
+            reasoningLines++;
+            if (reasoningLines > COLLAPSED_REASONING_LINES) {
+              process.stdout.write(chalk.dim.italic(" …"));
+              reasoningCut = true;
+              return;
+            }
+            process.stdout.write("\n  ");
           }
-          process.stdout.write(delta);
-        },
-      });
+          if (segments[i]) process.stdout.write(chalk.dim.italic(segments[i]));
+        }
+      };
+
+      const abortController = new AbortController();
+      const stopAbortListener = this.listenForGenerationAbort(abortController);
+      let turn;
+      try {
+        turn = await this.client.stream(this.messages, tools, this.config.model, {
+          onReasoning: thinkingMode === "off" ? undefined : printReasoning,
+          onText: (delta) => {
+            if (!textStarted) {
+              spinner.stop();
+              if (reasoningStarted) process.stdout.write("\n");
+              ui.assistantLabel();
+              textStarted = true;
+            }
+            process.stdout.write(delta);
+          },
+        }, { signal: abortController.signal });
+      } catch (err) {
+        spinner.stop();
+        stopAbortListener();
+        if (abortController.signal.aborted) {
+          this.stripReasoningContent();
+          ui.warn("\nInterrupted.");
+          return;
+        }
+        throw err;
+      } finally {
+        stopAbortListener();
+      }
 
       spinner.stop();
       if (textStarted) process.stdout.write("\n");
@@ -423,18 +588,27 @@ export class Agent {
         this.totalUsage.totalTokens += turn.usage.totalTokens;
       }
 
-      // Record the assistant message (content + any tool calls). Reasoning is
-      // intentionally excluded — the API rejects reasoning_content on input.
+      // Record the assistant message (content + any tool calls). In DeepSeek
+      // "thinking" mode, the reasoning_content that produced a tool call MUST be
+      // sent back together with the tool_calls or the next request fails with
+      // 400 ("reasoning_content ... must be passed back"). We attach it here and
+      // strip it once the turn concludes (see below) so stale reasoning is never
+      // resent on later user turns — the other half of DeepSeek's contract.
       const assistantMsg: ChatMessage = {
         role: "assistant",
         content: turn.content || null,
       };
       if (turn.toolCalls.length > 0) {
         assistantMsg.tool_calls = turn.toolCalls;
+        if (turn.reasoning) {
+          (assistantMsg as { reasoning_content?: string }).reasoning_content = turn.reasoning;
+        }
       }
       this.messages.push(assistantMsg);
 
       if (turn.toolCalls.length === 0) {
+        // Final answer reached: drop reasoning_content kept for in-flight tool calls.
+        this.stripReasoningContent();
         // Show usage after final answer.
         if (this.totalUsage.totalTokens > 0) {
           ui.usage(this.totalUsage, this.config.model);
@@ -453,7 +627,22 @@ export class Agent {
       }
     }
 
+    this.stripReasoningContent();
     ui.warn(`\nStopped after ${MAX_TOOL_ITERATIONS} tool iterations.`);
+  }
+
+  /**
+   * Remove reasoning_content from stored messages. DeepSeek thinking mode requires
+   * reasoning_content to accompany tool_calls during an active tool chain, but it
+   * must not be resent on subsequent user turns once the turn has concluded.
+   */
+  private stripReasoningContent(): void {
+    for (const message of this.messages) {
+      const withReasoning = message as { reasoning_content?: string };
+      if (withReasoning.reasoning_content !== undefined) {
+        delete withReasoning.reasoning_content;
+      }
+    }
   }
 
   private async executeToolCall(
@@ -486,9 +675,30 @@ export class Agent {
     }
 
     try {
+      const preHooks = runHooks("preToolUse", this.ctx.cwd, { toolName: tool.name, preview });
+      for (const hook of preHooks) {
+        ui.toolResult(`hook: ${hook.command}`, !hook.ok);
+      }
+      const blockingHook = preHooks.find((hook) => !hook.ok && hook.blocking);
+      if (blockingHook) {
+        return `Tool blocked by preToolUse hook.\n${renderHookRuns(preHooks)}`;
+      }
+
       const result = await tool.run(args, this.ctx);
       ui.toolResult(result.summary ?? tool.name, Boolean(result.isError));
-      return result.content;
+      if (result.display) ui.diff(result.display);
+
+      const postHooks = runHooks("postToolUse", this.ctx.cwd, {
+        toolName: tool.name,
+        preview,
+        status: result.isError ? "error" : "success",
+      });
+      for (const hook of postHooks) {
+        ui.toolResult(`hook: ${hook.command}`, !hook.ok);
+      }
+
+      const hookText = [renderHookRuns(preHooks), renderHookRuns(postHooks)].filter(Boolean).join("\n");
+      return hookText ? `${result.content}\n\nHook results:\n${hookText}` : result.content;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       ui.toolResult(`${tool.name}: ${msg}`, true);

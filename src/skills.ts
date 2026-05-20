@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { findProjectRoot } from "./project.js";
+import { enabledPluginSkillSources } from "./plugins.js";
 
 export interface SkillCommand {
   name: string;
@@ -9,7 +10,9 @@ export interface SkillCommand {
   description: string;
   prompt: string;
   source: string;
-  scope: "project" | "global";
+  scope: "project" | "global" | "plugin";
+  /** Owning plugin name when scope is "plugin". */
+  plugin?: string;
 }
 
 interface ParsedSkillFile {
@@ -50,7 +53,7 @@ function parseSkillFile(raw: string): ParsedSkillFile {
   return { metadata, body };
 }
 
-function readSkillFile(file: string, scope: SkillCommand["scope"]): SkillCommand | null {
+function readSkillFile(file: string, scope: SkillCommand["scope"], plugin?: string): SkillCommand | null {
   try {
     const raw = fs.readFileSync(file, "utf8");
     const parsed = parseSkillFile(raw);
@@ -65,19 +68,20 @@ function readSkillFile(file: string, scope: SkillCommand["scope"]): SkillCommand
       prompt: parsed.body,
       source: file,
       scope,
+      plugin,
     };
   } catch {
     return null;
   }
 }
 
-function loadSkillDir(dir: string, scope: SkillCommand["scope"]): SkillCommand[] {
+function loadSkillDir(dir: string, scope: SkillCommand["scope"], plugin?: string): SkillCommand[] {
   if (!fs.existsSync(dir)) return [];
   const skills: SkillCommand[] = [];
 
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-    const skill = readSkillFile(path.join(dir, entry.name), scope);
+    const skill = readSkillFile(path.join(dir, entry.name), scope, plugin);
     if (skill) skills.push(skill);
   }
 
@@ -95,8 +99,14 @@ export function globalSkillDir(): string {
 export function loadSkillCommands(cwd: string): SkillCommand[] {
   const merged = new Map<string, SkillCommand>();
 
+  // Precedence (later overrides earlier): global < plugin < project.
   for (const skill of loadSkillDir(GLOBAL_SKILL_DIR, "global")) {
     merged.set(skill.name, skill);
+  }
+  for (const { dir, plugin } of enabledPluginSkillSources()) {
+    for (const skill of loadSkillDir(dir, "plugin", plugin)) {
+      merged.set(skill.name, skill);
+    }
   }
   for (const skill of loadSkillDir(projectSkillDir(cwd), "project")) {
     merged.set(skill.name, skill);

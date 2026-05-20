@@ -6,9 +6,9 @@ An agentic coding CLI for DeepSeek models, inspired by the Claude Code workflow.
 
 - Interactive REPL and one-shot prompt mode.
 - DeepSeek-compatible OpenAI SDK client with streaming responses.
-- Tool calling loop for reading/editing files, writing files, running shell commands, grep/glob search, and basic web fetch/search.
+- Tool calling loop for reading/editing files, writing files, running shell commands, grep/glob search, todo tracking, and basic web fetch/search.
 - Approval prompts for side-effecting tools, with a dangerous `--yes` mode for trusted sessions.
-- Slash commands for help, model selection, tool listing, config display, context compression, conversation reset, and project memory.
+- Slash commands for help, model selection, tool/todo listing, config display, review/doctor, context compression, conversation reset, and project memory.
 - Project instruction loading from `DEEPSEEK.md`, `CLAUDE.md`, and `AGENTS.md`.
 
 ## Install and Run
@@ -37,12 +37,19 @@ or run the CLI interactively and enter the key when prompted.
 - `/skills`: list custom skill commands.
 - `/skill-new <name>`: create a project skill template.
 - `/compress`: summarize the current conversation into durable context and save it with the project session.
+- `/review [ref]`: review local git changes or compare against a ref.
+- `/task <prompt>`: run an isolated subagent-style task without polluting main history.
+- `/hooks [init|list]`: configure preToolUse/postToolUse shell hooks.
+- `/mcp [list|init|reload]`: configure and load MCP stdio servers as tools.
+- `/doctor`: check local environment/configuration health.
+- `/thinking [on|off|collapsed|full]`: control reasoning trace display.
+- `/todos`: show the current TodoWrite task list.
 - `/tools`: list available tools.
 - `/config`: show active config.
 - `/clear`: reset the conversation.
 - `/exit`: quit.
 
-Press Tab after `/` to complete commands. Typing `/` by itself lists commands. Long sessions are auto-compressed before the next request when they exceed the built-in context threshold.
+Press Tab after `/` to complete commands. Typing `/` by itself lists commands. Use `@path/to/file` in prompts to attach file contents, `# note` to append project memory, `! command` to run shell directly, and Esc/Ctrl-C to interrupt generation. Long sessions are auto-compressed before the next request when they exceed the built-in context threshold. Use `--continue` or `--resume` with one-shot prompts to restore the saved project session.
 
 ## Custom Skills
 
@@ -71,6 +78,35 @@ Extra user input:
 {{input}}
 ```
 
+## MCP Servers
+
+DeepSeek CLI can load external MCP stdio servers and expose their tools to the model.
+
+```bash
+deepseek
+/mcp init
+# edit .deepseek/mcp.json
+/mcp reload
+/mcp
+```
+
+Project config lives at `.deepseek/mcp.json`; global config lives at `~/.deepseek-cli/mcp.json`. The loader also reads Claude-compatible `.mcp.json` files that use the `mcpServers` key.
+
+Example:
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-server.js"]
+    }
+  }
+}
+```
+
+Loaded MCP tools are registered as `mcp__server__tool` and still go through the normal permission confirmation flow before execution.
+
 ## Models
 
 - `deepseek-v4-pro`: flagship V4 model for complex coding, reasoning, and agentic work.
@@ -84,7 +120,7 @@ Extra user input:
 - Session continuity: save and resume conversations per project.
 - Permission management: persisted allow/deny rules and command risk checks.
 - Project intelligence: indexing, symbol search, diagnostics, and test discovery.
-- UX polish: multiline input, shell mode, status/cost display, and richer terminal output.
+- UX polish: multiline input, shell mode, status/cost display, interruptible generation, and richer terminal output.
 
 ## Development
 
@@ -92,4 +128,3 @@ Extra user input:
 npm run typecheck
 npm run build
 ```
-# deepseek-cli

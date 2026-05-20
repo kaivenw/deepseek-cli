@@ -21,13 +21,6 @@ export interface ProjectMemory {
   content: string;
 }
 
-export interface InitProjectMemoryResult {
-  created: boolean;
-  path: string;
-  root: string;
-  message: string;
-}
-
 export function findProjectRoot(cwd: string): string {
   let current = path.resolve(cwd);
 
@@ -118,90 +111,24 @@ export function formatProjectMemoryForPrompt(cwd: string): string {
   ].join("\n");
 }
 
-function readPackageJson(root: string): Record<string, unknown> | null {
-  const file = path.join(root, "package.json");
-  const raw = readTextFile(file);
-  if (!raw) return null;
+export function projectMemoryTarget(cwd: string): string {
+  return path.join(findProjectRoot(cwd), "DEEPSEEK.md");
+}
 
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return null;
+/** Append a quick note under a "## Notes" section in DEEPSEEK.md (creating it if needed). */
+export function appendProjectMemory(cwd: string, note: string): string {
+  const target = projectMemoryTarget(cwd);
+  const line = `- ${note.trim()}`;
+  let body = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "# Project Notes\n";
+
+  const idx = body.indexOf("## Notes");
+  if (idx === -1) {
+    body = body.trimEnd() + "\n\n## Notes\n" + line + "\n";
+  } else {
+    const headerEnd = body.indexOf("\n", idx);
+    const insertAt = headerEnd === -1 ? body.length : headerEnd + 1;
+    body = body.slice(0, insertAt) + line + "\n" + body.slice(insertAt);
   }
-}
-
-function listScripts(pkg: Record<string, unknown> | null): string[] {
-  const scripts = pkg?.scripts;
-  if (!scripts || typeof scripts !== "object" || Array.isArray(scripts)) return [];
-
-  return Object.entries(scripts as Record<string, unknown>)
-    .filter(([, value]) => typeof value === "string")
-    .map(([name, value]) => `- \`npm run ${name}\`: ${value}`);
-}
-
-function detectStack(root: string, pkg: Record<string, unknown> | null): string[] {
-  const stack: string[] = [];
-
-  if (pkg) stack.push("Node.js");
-  if (fs.existsSync(path.join(root, "tsconfig.json"))) stack.push("TypeScript");
-  if (fs.existsSync(path.join(root, "package-lock.json"))) stack.push("npm");
-  if (fs.existsSync(path.join(root, "pnpm-lock.yaml"))) stack.push("pnpm");
-  if (fs.existsSync(path.join(root, "yarn.lock"))) stack.push("Yarn");
-  if (fs.existsSync(path.join(root, "src"))) stack.push("source in `src/`");
-
-  return stack;
-}
-
-export function initProjectMemory(cwd: string): InitProjectMemoryResult {
-  const root = findProjectRoot(cwd);
-  const target = path.join(root, "DEEPSEEK.md");
-
-  if (fs.existsSync(target)) {
-    return {
-      created: false,
-      path: target,
-      root,
-      message: "DEEPSEEK.md already exists.",
-    };
-  }
-
-  const pkg = readPackageJson(root);
-  const projectName =
-    typeof pkg?.name === "string" && pkg.name.trim() ? pkg.name.trim() : path.basename(root);
-  const description =
-    typeof pkg?.description === "string" && pkg.description.trim()
-      ? pkg.description.trim()
-      : "Add a short project description here.";
-  const stack = detectStack(root, pkg);
-  const scripts = listScripts(pkg);
-
-  const content = [
-    `# ${projectName} Project Instructions`,
-    "",
-    "## Project Overview",
-    `- Purpose: ${description}`,
-    stack.length > 0 ? `- Stack: ${stack.join(", ")}` : "- Stack: Add the primary runtime/frameworks here.",
-    "",
-    "## Common Commands",
-    ...(scripts.length > 0 ? scripts : ["- Add build, test, lint, and dev commands here."]),
-    "",
-    "## Working Guidelines",
-    "- Read the relevant files before changing code.",
-    "- Keep changes focused on the requested behavior.",
-    "- Run type checking, builds, or targeted tests after code changes when available.",
-    "- Do not commit secrets or local environment files.",
-    "",
-    "## Project Notes",
-    "- Add domain rules, architecture decisions, and conventions that DeepSeek CLI should follow here.",
-    "",
-  ].join("\n");
-
-  fs.writeFileSync(target, content, "utf8");
-
-  return {
-    created: true,
-    path: target,
-    root,
-    message: "Created DEEPSEEK.md.",
-  };
+  fs.writeFileSync(target, body, "utf8");
+  return target;
 }

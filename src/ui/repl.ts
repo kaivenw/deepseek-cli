@@ -5,6 +5,8 @@ import type { Config } from "../config.js";
 import { isCommand, runCommand, suggestCommands } from "../commands.js";
 import { ui, chalk } from "./render.js";
 import { loadSession, saveSession } from "../session.js";
+import { appendProjectMemory } from "../project.js";
+import { mcpStatus } from "../mcp.js";
 
 interface CommandSuggestion {
   value: string;
@@ -352,13 +354,14 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
     sessionRestored = true;
   }
 
-  ui.banner(
-    config.model,
-    process.cwd(),
-    sessionRestored
-      ? `session: restored (${agent.messageCount()} messages${agent.getContextSummary() ? ", compressed context active" : ""})`
+  const mcp = mcpStatus();
+  ui.banner(config.model, process.cwd(), {
+    sessionMsg: sessionRestored
+      ? "session: restored (" + agent.messageCount() + " messages" + (agent.getContextSummary() ? ", compressed context active" : "") + ")"
       : undefined,
-  );
+    mcpTools: mcp.infos.length,
+    mcpErrors: mcp.errors.length,
+  });
 
   const history: string[] = [];
 
@@ -393,6 +396,23 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
       const command = input.trim().slice(1);
       ui.toolCall(`! ${command}`);
       runShellCommand(command);
+      continue;
+    }
+
+    // Quick memory: #note appends to DEEPSEEK.md.
+    if (input.trim().startsWith("#")) {
+      const note = input.trim().slice(1).trim();
+      if (!note) {
+        ui.warn("Usage: #<note to remember>");
+        continue;
+      }
+      try {
+        const file = appendProjectMemory(process.cwd(), note);
+        agent.reloadProjectContext();
+        ui.success(`Added to project memory (${file}).`);
+      } catch (err) {
+        ui.error(`Could not write memory: ${(err as Error).message}`);
+      }
       continue;
     }
 

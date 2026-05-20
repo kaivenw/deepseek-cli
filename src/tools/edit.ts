@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Tool } from "./types.js";
+import { makeDiff } from "./diff.js";
 
 export const editTool: Tool = {
   name: "edit_file",
@@ -68,9 +69,11 @@ export const editTool: Tool = {
       : original.replace(oldStr, newStr);
     fs.writeFileSync(abs, updated, "utf8");
 
+    const replacements = replaceAll ? count : 1;
     return {
-      content: `Edited ${rel} (${replaceAll ? count : 1} replacement${(replaceAll ? count : 1) > 1 ? "s" : ""}).`,
+      content: `Edited ${rel} (${replacements} replacement${replacements > 1 ? "s" : ""}).`,
       summary: `Edited ${rel}`,
+      display: makeDiff(rel, original, updated),
     };
   },
 };

@@ -1,17 +1,26 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { confirm, password } from "@inquirer/prompts";
-import { loadConfig, saveConfig, findModel, type Config } from "./config.js";
+import { loadConfig, saveConfig, findModel, normalizeThinkingMode, type Config } from "./config.js";
 import { Agent } from "./agent.js";
 import { createPermissionManager } from "./permissions.js";
 import { startRepl } from "./ui/repl.js";
+import { loadSession, saveSession } from "./session.js";
 import { ui, chalk } from "./ui/render.js";
+import { loadMcpTools, shutdownMcp } from "./mcp.js";
+import { clearExternalTools, registerExternalTools } from "./tools/index.js";
 
 interface CliOptions {
   model?: string;
   print?: boolean;
   yes?: boolean;
   apiKey?: string;
+  thinking?: string;
+  showThinking?: boolean;
+  hideThinking?: boolean;
+  /** Commander stores --continue under this property name. */
+  continue?: boolean;
+  resume?: boolean;
 }
 
 function readStdin(): Promise<string> {
@@ -53,6 +62,8 @@ async function ensureApiKey(config: Config): Promise<boolean> {
   return true;
 }
 
+process.once("exit", () => shutdownMcp());
+
 async function main(): Promise<void> {
   const program = new Command();
   program
@@ -64,6 +75,11 @@ async function main(): Promise<void> {
     .option("-p, --print", "print mode: run the prompt once and exit")
     .option("--api-key <key>", "DeepSeek API key (overrides config/env)")
     .option("-y, --yes", "auto-approve all tool actions (use with care)")
+    .option("--thinking <mode>", "reasoning display: off | collapsed | full (overrides config)")
+    .option("--show-thinking", "alias for --thinking full")
+    .option("--hide-thinking", "alias for --thinking off")
+    .option("--continue", "continue the saved session for this project before running the prompt")
+    .option("--resume", "alias for --continue")
     .allowExcessArguments(true);
 
   program.parse();
@@ -81,6 +97,11 @@ async function main(): Promise<void> {
       ui.warn(`Note: '${opts.model}' is not a recognized DeepSeek model.`);
     }
   }
+  // Per-run override of the thinking-display preference (not persisted).
+  const thinkingOverride =
+    normalizeThinkingMode(opts.thinking) ??
+    (opts.hideThinking ? "off" : opts.showThinking ? "full" : undefined);
+  if (thinkingOverride) config.thinkingMode = thinkingOverride;
 
   if (!(await ensureApiKey(config))) {
     process.exit(1);
@@ -91,7 +112,22 @@ async function main(): Promise<void> {
     autoApprove: Boolean(opts.yes),
     preApproved: config.alwaysAllow,
   });
+  clearExternalTools();
+  const mcp = await loadMcpTools(process.cwd());
+  registerExternalTools(mcp.tools);
+  for (const error of mcp.errors) ui.warn(`MCP: ${error}`);
+
   const agent = new Agent(config, permissions, ctx);
+  const shouldContinue = Boolean(opts.continue || opts.resume);
+  if (shouldContinue) {
+    const session = loadSession(process.cwd());
+    if (session && (session.messages.length > 1 || session.contextSummary)) {
+      agent.restoreSession(session);
+      ui.info(`Continuing saved session (${agent.messageCount()} messages${agent.getContextSummary() ? ", compressed context active" : ""}).`);
+    } else {
+      ui.warn("No saved session found for this project; starting fresh.");
+    }
+  }
 
   // One-shot when args/-p are given, or when stdin is piped (not a TTY).
   let prompt = promptArgs.join(" ").trim();
@@ -107,6 +143,7 @@ async function main(): Promise<void> {
     }
     try {
       await agent.run(prompt);
+      saveSession(process.cwd(), agent.getSession());
       process.exit(0);
     } catch (err) {
       ui.error(`\nError: ${(err as Error).message}`);

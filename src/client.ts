@@ -4,6 +4,10 @@ import type { Config } from "./config.js";
 export type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 export type ToolCall = OpenAI.Chat.Completions.ChatCompletionMessageToolCall;
 
+export interface StreamOptions {
+  signal?: AbortSignal;
+}
+
 export interface StreamCallbacks {
   /** Visible answer text, streamed token by token. */
   onText?(delta: string): void;
@@ -51,6 +55,7 @@ export class DeepSeekClient {
     tools: OpenAI.Chat.Completions.ChatCompletionTool[],
     model: string,
     callbacks: StreamCallbacks = {},
+    options: StreamOptions = {},
   ): Promise<AssistantTurn> {
     const stream = await this.client.chat.completions.create({
       model,
@@ -58,7 +63,7 @@ export class DeepSeekClient {
       tools: tools.length > 0 ? tools : undefined,
       tool_choice: tools.length > 0 ? "auto" : undefined,
       stream: true,
-    });
+    }, options.signal ? { signal: options.signal } : undefined);
 
     let content = "";
     let reasoning = "";
