@@ -5,6 +5,7 @@ import { loadConfig, saveConfig, findModel, normalizeThinkingMode, type Config }
 import { Agent } from "./agent.js";
 import { createPermissionManager } from "./permissions.js";
 import { startRepl } from "./ui/repl.js";
+import { extractDraggedPaths } from "./attachments.js";
 import { loadSession, saveSession } from "./session.js";
 import { ui, chalk } from "./ui/render.js";
 import { loadMcpTools, shutdownMcp } from "./mcp.js";
@@ -142,7 +143,13 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      await agent.run(prompt);
+      agent.sessionStart();
+      const dragged = extractDraggedPaths(prompt, process.cwd());
+      if (dragged.paths.length > 0) {
+        await agent.run(dragged.text, { attachments: dragged.paths });
+      } else {
+        await agent.run(prompt);
+      }
       saveSession(process.cwd(), agent.getSession());
       process.exit(0);
     } catch (err) {

@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { findProjectRoot } from "./project.js";
 
-export type HookEvent = "preToolUse" | "postToolUse";
+export type HookEvent = "preToolUse" | "postToolUse" | "userPromptSubmit" | "sessionStart" | "stop";
+
+/** Events whose hooks can abort the action when they fail (and continueOnError is not set). */
+const BLOCKING_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>(["preToolUse", "userPromptSubmit"]);
 
 export interface HookSpec {
   command: string;
@@ -14,11 +17,15 @@ export interface HookSpec {
 export interface HookConfig {
   preToolUse?: HookSpec[];
   postToolUse?: HookSpec[];
+  userPromptSubmit?: HookSpec[];
+  sessionStart?: HookSpec[];
+  stop?: HookSpec[];
 }
 
 export interface HookContext {
-  toolName: string;
-  preview: string;
+  toolName?: string;
+  preview?: string;
+  prompt?: string;
   status?: "success" | "error";
 }
 
@@ -57,15 +64,19 @@ export function createHooksTemplate(cwd: string): { path: string; created: boole
   return { path: file, created: true };
 }
 
+const HOOK_EVENTS: HookEvent[] = ["preToolUse", "postToolUse", "userPromptSubmit", "sessionStart", "stop"];
+
 export function loadHooks(cwd: string): HookConfig {
   const file = hooksPath(cwd);
   try {
     if (!fs.existsSync(file)) return {};
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as HookConfig;
-    return {
-      preToolUse: Array.isArray(parsed.preToolUse) ? parsed.preToolUse.filter(isHookSpec) : [],
-      postToolUse: Array.isArray(parsed.postToolUse) ? parsed.postToolUse.filter(isHookSpec) : [],
-    };
+    const config: HookConfig = {};
+    for (const event of HOOK_EVENTS) {
+      const list = (parsed as Record<string, unknown>)[event];
+      config[event] = Array.isArray(list) ? list.filter(isHookSpec) : [];
+    }
+    return config;
   } catch {
     return {};
   }
@@ -77,12 +88,12 @@ function isHookSpec(value: unknown): value is HookSpec {
 
 export function runHooks(event: HookEvent, cwd: string, context: HookContext): HookRunResult[] {
   const config = loadHooks(cwd);
-  const hooks = event === "preToolUse" ? config.preToolUse ?? [] : config.postToolUse ?? [];
+  const hooks = config[event] ?? [];
   const results: HookRunResult[] = [];
 
   for (const hook of hooks) {
     const command = hook.command.trim();
-    const blocking = event === "preToolUse" && hook.continueOnError !== true;
+    const blocking = BLOCKING_EVENTS.has(event) && hook.continueOnError !== true;
     try {
       const output = execSync(command, {
         cwd,
@@ -93,9 +104,10 @@ export function runHooks(event: HookEvent, cwd: string, context: HookContext): H
         env: {
           ...process.env,
           DEEPSEEK_HOOK_EVENT: event,
-          DEEPSEEK_TOOL_NAME: context.toolName,
-          DEEPSEEK_TOOL_PREVIEW: context.preview,
+          DEEPSEEK_TOOL_NAME: context.toolName ?? "",
+          DEEPSEEK_TOOL_PREVIEW: context.preview ?? "",
           DEEPSEEK_TOOL_STATUS: context.status ?? "",
+          DEEPSEEK_PROMPT: context.prompt ?? "",
         },
       });
       results.push({ command, ok: true, output: output.trim(), blocking });

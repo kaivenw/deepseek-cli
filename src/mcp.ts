@@ -6,12 +6,22 @@ import type { Tool } from "./tools/types.js";
 import { findProjectRoot } from "./project.js";
 
 interface McpServerConfig {
-  command: string;
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
   disabled?: boolean;
   timeoutMs?: number;
+  /** Remote transport: set `url` (and optionally type "http"/"sse") for a Streamable-HTTP server. */
+  type?: "stdio" | "http" | "sse";
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+interface McpClient {
+  listTools(): Promise<McpToolDefinition[]>;
+  callTool(name: string, args: Record<string, unknown>): Promise<string>;
+  shutdown(): void;
 }
 
 interface McpConfig {
@@ -51,7 +61,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 
 let loadedInfos: McpToolInfo[] = [];
 let loadedErrors: string[] = [];
-const clients = new Map<string, McpStdioClient>();
+const clients = new Map<string, McpClient>();
 
 export function globalMcpPath(): string {
   return GLOBAL_MCP_PATH;
@@ -133,7 +143,7 @@ function textFromMcpResult(result: unknown): string {
   return JSON.stringify(result, null, 2);
 }
 
-class McpStdioClient {
+class McpStdioClient implements McpClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
   private buffer = "";
@@ -152,6 +162,7 @@ class McpStdioClient {
 
   private start(): void {
     if (this.child) return;
+    if (!this.config.command) throw new Error(`MCP server ${this.serverName} has no command.`);
     const cwd = this.config.cwd ? path.resolve(this.baseCwd, this.config.cwd) : this.baseCwd;
     this.child = spawn(this.config.command, this.config.args ?? [], {
       cwd,
@@ -254,7 +265,123 @@ class McpStdioClient {
   }
 }
 
-function toolFromMcp(client: McpStdioClient, serverName: string, remote: McpToolDefinition): { tool: Tool; info: McpToolInfo } {
+/** Parse one or more SSE `data:` blocks and return the JSON-RPC message for `id`. */
+function parseSseJson(text: string, id: number | undefined): JsonRpcResponse | null {
+  const candidates: JsonRpcResponse[] = [];
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("\n");
+    if (!data) continue;
+    try {
+      candidates.push(JSON.parse(data) as JsonRpcResponse);
+    } catch {
+      // ignore non-JSON event payloads
+    }
+  }
+  if (id !== undefined) {
+    const matched = candidates.find((c) => Number(c.id) === Number(id));
+    if (matched) return matched;
+  }
+  return candidates.find((c) => c.result !== undefined || c.error !== undefined) ?? candidates[0] ?? null;
+}
+
+/** MCP client over Streamable HTTP (POST JSON-RPC; JSON or SSE responses). */
+class McpHttpClient implements McpClient {
+  private sessionId: string | null = null;
+  private nextId = 1;
+  private initialized = false;
+
+  constructor(
+    private serverName: string,
+    private url: string,
+    private headers: Record<string, string>,
+    private timeoutMs: number,
+  ) {}
+
+  private async rpc(method: string, params?: unknown, isNotification = false): Promise<unknown> {
+    const id = isNotification ? undefined : this.nextId++;
+    const payload = isNotification
+      ? { jsonrpc: "2.0", method, params }
+      : { jsonrpc: "2.0", id, method, params };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(this.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(this.sessionId ? { "Mcp-Session-Id": this.sessionId } : {}),
+          ...this.headers,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) this.sessionId = sid;
+
+    if (isNotification) {
+      await res.text().catch(() => "");
+      return undefined;
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`.trim());
+    }
+
+    const contentType = res.headers.get("content-type") ?? "";
+    const text = await res.text();
+    const message = contentType.includes("text/event-stream")
+      ? parseSseJson(text, id)
+      : (JSON.parse(text) as JsonRpcResponse);
+    if (!message) throw new Error(`No JSON-RPC response for ${method}`);
+    if (message.error) {
+      throw new Error(message.error.message ?? `MCP error ${message.error.code ?? "unknown"}`);
+    }
+    return message.result;
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+    await this.rpc("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "deepseek-cli", version: "0.1.0" },
+    });
+    await this.rpc("notifications/initialized", undefined, true);
+    this.initialized = true;
+  }
+
+  async listTools(): Promise<McpToolDefinition[]> {
+    await this.initialize();
+    const result = await this.rpc("tools/list", {});
+    const tools = (result as { tools?: unknown })?.tools;
+    return Array.isArray(tools)
+      ? tools.filter((tool): tool is McpToolDefinition => !!tool && typeof (tool as McpToolDefinition).name === "string")
+      : [];
+  }
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+    await this.initialize();
+    const result = await this.rpc("tools/call", { name, arguments: args });
+    return textFromMcpResult(result);
+  }
+
+  shutdown(): void {
+    // Stateless HTTP — nothing to tear down.
+  }
+}
+
+function toolFromMcp(client: McpClient, serverName: string, remote: McpToolDefinition): { tool: Tool; info: McpToolInfo } {
   const toolName = mcpToolName(serverName, remote.name);
   const description = remote.description || `MCP tool ${remote.name} from ${serverName}`;
   const info: McpToolInfo = { toolName, serverName, remoteName: remote.name, description };
@@ -295,11 +422,23 @@ export async function loadMcpTools(cwd: string): Promise<McpLoadResult> {
 
   for (const [serverName, config] of Object.entries(servers)) {
     if (!config || config.disabled) continue;
-    if (!config.command) {
-      loadedErrors.push(`${serverName}: missing command`);
-      continue;
+
+    const isHttp = config.type === "http" || config.type === "sse" || (!!config.url && !config.command);
+    let client: McpClient;
+    if (isHttp) {
+      if (!config.url) {
+        loadedErrors.push(`${serverName}: missing url for http transport`);
+        continue;
+      }
+      const timeoutMs = Math.min(Math.max(config.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1000), 600_000);
+      client = new McpHttpClient(serverName, config.url, config.headers ?? {}, timeoutMs);
+    } else {
+      if (!config.command) {
+        loadedErrors.push(`${serverName}: missing command (or url for http transport)`);
+        continue;
+      }
+      client = new McpStdioClient(serverName, config, cwd);
     }
-    const client = new McpStdioClient(serverName, config, cwd);
     clients.set(serverName, client);
     try {
       const remoteTools = await client.listTools();

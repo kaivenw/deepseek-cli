@@ -9,6 +9,10 @@ export interface ToolContext {
   getThinkingMode?(): ThinkingMode;
   /** Shared task list used by todo_read/todo_write. */
   todoStore?: TodoStore;
+  /** Run an isolated sub-agent to completion and return its final answer. */
+  runSubagent?(prompt: string, opts?: { tools?: string[] }): Promise<string>;
+  /** Record a file's pre-change content into the active checkpoint (null = file did not exist). */
+  recordFileBackup?(absPath: string, previousContent: string | null): void;
 }
 
 export interface ToolResult {

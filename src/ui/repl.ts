@@ -6,6 +6,8 @@ import { isCommand, runCommand, suggestCommands } from "../commands.js";
 import { ui, chalk } from "./render.js";
 import { loadSession, saveSession } from "../session.js";
 import { appendProjectMemory } from "../project.js";
+import { extractDraggedPaths } from "../attachments.js";
+import path from "node:path";
 import { mcpStatus } from "../mcp.js";
 
 interface CommandSuggestion {
@@ -363,6 +365,8 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
     mcpErrors: mcp.errors.length,
   });
 
+  agent.sessionStart();
+
   const history: string[] = [];
 
   while (true) {
@@ -396,6 +400,24 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
       const command = input.trim().slice(1);
       ui.toolCall(`! ${command}`);
       runShellCommand(command);
+      continue;
+    }
+
+    // Dragged-in files: a terminal inserts absolute paths as text. Detect them
+    // (before the slash-command check, since paths start with "/") and attach.
+    const dragged = extractDraggedPaths(input, process.cwd());
+    if (dragged.paths.length > 0) {
+      ui.info(`📎 attached: ${dragged.paths.map((p) => path.basename(p)).join(", ")}`);
+      try {
+        await agent.run(dragged.text, { attachments: dragged.paths });
+        saveSession(process.cwd(), agent.getSession());
+      } catch (err) {
+        if (isAbortError(err)) {
+          ui.warn("\nInterrupted.");
+        } else {
+          ui.error(`\nError: ${(err as Error).message}`);
+        }
+      }
       continue;
     }
 

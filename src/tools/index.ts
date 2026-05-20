@@ -10,6 +10,7 @@ import { webSearchTool } from "./webSearch.js";
 import { webFetchTool } from "./webFetch.js";
 import { setThinkingTool } from "./setThinking.js";
 import { todoReadTool, todoWriteTool } from "./todo.js";
+import { taskTool } from "./task.js";
 
 export type { Tool, ToolContext, ToolResult } from "./types.js";
 
@@ -25,6 +26,7 @@ const BASE_TOOLS: Tool[] = [
   setThinkingTool,
   todoReadTool,
   todoWriteTool,
+  taskTool,
 ];
 
 export const ALL_TOOLS: Tool[] = [...BASE_TOOLS];

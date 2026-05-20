@@ -67,6 +67,7 @@ export const editTool: Tool = {
     const updated = replaceAll
       ? original.split(oldStr).join(newStr)
       : original.replace(oldStr, newStr);
+    ctx.recordFileBackup?.(abs, original);
     fs.writeFileSync(abs, updated, "utf8");
 
     const replacements = replaceAll ? count : 1;

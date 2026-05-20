@@ -137,7 +137,7 @@ export const ui = {
         chalk.bold.hex("#f4b860")("Tips for getting started"),
         "Run " + chalk.cyan("/init") + " to create project memory",
         "Type " + chalk.cyan("/") + " to browse and fuzzy-search commands",
-        "Use " + chalk.cyan("@file") + " to attach file context",
+        "Use " + chalk.cyan("@file") + " or " + chalk.cyan("drag a file in") + " to attach",
         "Use " + chalk.cyan("#note") + " to write memory quickly",
         "Use " + chalk.cyan("!cmd") + " for direct shell commands",
         "",
@@ -166,7 +166,7 @@ export const ui = {
         centerDisplay(chalk.dim(sessionLine), innerWidth),
         centerDisplay(chalk.dim("MCP: " + mcpText + mcpErrorText), innerWidth),
         "",
-        "  " + accent.bold("Tips") + " " + chalk.dim("/init · / · @file · #note · !cmd · /mcp"),
+        "  " + accent.bold("Tips") + " " + chalk.dim("/init · / · @file · drag-in · #note · !cmd · /mcp"),
         "",
       ];
       for (const line of lines) console.log(panelLine(line, innerWidth));

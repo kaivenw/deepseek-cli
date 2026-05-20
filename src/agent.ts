@@ -10,10 +10,38 @@ import { formatProjectMemoryForPrompt } from "./project.js";
 import { ui, chalk, Spinner } from "./ui/render.js";
 import { TodoStore, type TodoItem } from "./todo.js";
 import { runHooks } from "./hooks.js";
+import type OpenAI from "openai";
 
 const MAX_TOOL_ITERATIONS = 25;
 const FILE_MENTION_RE = /(^|\s)@([^\s@]+)/g;
 const MAX_MENTION_CHARS = 50_000;
+const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_CHECKPOINTS = 50;
+
+interface Checkpoint {
+  id: number;
+  label: string;
+  time: string;
+  messages: ChatMessage[];
+  contextSummary: string | null;
+  /** Original file contents captured before edits this turn (null = file did not exist). */
+  backups: Map<string, string | null>;
+}
+
+export interface CheckpointInfo {
+  index: number;
+  label: string;
+  time: string;
+  files: number;
+}
+
+export interface RunOptions {
+  /** Absolute file paths to attach (e.g. dragged into the terminal). */
+  attachments?: string[];
+}
+
+type UserContent = string | OpenAI.Chat.Completions.ChatCompletionContentPart[];
 
 /** Expand `@path` mentions in user input by appending the referenced file contents. */
 function expandFileMentions(input: string, cwd: string): string {
@@ -91,7 +119,19 @@ function valueToText(value: unknown): string {
 }
 
 function messageContentToText(message: ChatMessage): string {
-  return valueToText((message as { content?: unknown }).content);
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        const p = part as { type?: string; text?: string };
+        if (p.type === "text") return p.text ?? "";
+        if (p.type === "image_url") return "[image]";
+        return "";
+      })
+      .join(" ");
+  }
+  return valueToText(content);
 }
 
 function truncateText(text: string, maxChars: number): string {
@@ -266,6 +306,10 @@ export class Agent {
   private contextSummary: string | null = null;
   private compressedAt: string | null = null;
   private todoStore = new TodoStore();
+  private subagentDepth = 0;
+  private checkpoints: Checkpoint[] = [];
+  private checkpointSeq = 0;
+  private suppressCheckpoint = false;
   totalUsage: Usage;
 
   constructor(
@@ -286,6 +330,8 @@ export class Agent {
     };
     toolCtx.getThinkingMode = () => this.config.thinkingMode ?? "off";
     toolCtx.todoStore = this.todoStore;
+    toolCtx.runSubagent = (prompt, opts) => this.runSubagent(prompt, opts ?? {});
+    toolCtx.recordFileBackup = (absPath, previous) => this.recordFileBackup(absPath, previous);
     this.ctx = toolCtx;
     this.messages = [];
     this.refreshSystemPrompt();
@@ -334,6 +380,7 @@ export class Agent {
     this.contextSummary = null;
     this.compressedAt = null;
     this.messages = [];
+    this.checkpoints = [];
     this.refreshSystemPrompt();
     this.totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   }
@@ -363,6 +410,7 @@ export class Agent {
       { role: "system", content: systemPrompt(this.ctx.cwd, this.contextSummary) },
       ...data.messages.filter((m) => roleOf(m) !== "system"),
     ];
+    this.checkpoints = [];
     this.totalUsage = { ...data.totalUsage };
   }
 
@@ -480,20 +528,80 @@ export class Agent {
   async runIsolated(userInput: string): Promise<void> {
     const savedMessages = this.messages;
     this.messages = [];
+    this.suppressCheckpoint = true;
     this.refreshSystemPrompt();
     try {
       await this.run(userInput);
     } finally {
+      this.suppressCheckpoint = false;
       this.messages = savedMessages;
       this.refreshSystemPrompt();
     }
   }
 
-  async run(userInput: string): Promise<void> {
-    const input = expandFileMentions(userInput, this.ctx.cwd);
+  /** Build a user message content, attaching files (text inline, images as image_url). */
+  private buildUserContent(text: string, attachments: string[]): { content: UserContent; estimate: string } {
+    let textContent = text;
+    const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] = [];
+    const visionSupported =
+      findModel(this.config.model)?.supportsVision === true ||
+      ["1", "true", "on", "yes"].includes((process.env.DEEPSEEK_VISION ?? "").toLowerCase());
 
-    if (this.shouldAutoCompress(input)) {
-      ui.warn(`Context is large (~${this.estimatedContextTokens(input).toLocaleString()} estimated tokens); compressing before continuing.`);
+    for (const file of attachments) {
+      const ext = path.extname(file).toLowerCase();
+      try {
+        if (IMAGE_EXT.has(ext)) {
+          // DeepSeek chat models are text-only; only send images to vision models.
+          if (!visionSupported) {
+            const kb = (() => { try { return Math.round(fs.statSync(file).size / 1024); } catch { return 0; } })();
+            ui.warn(`Image ${path.basename(file)} not sent: model '${this.config.model}' has no vision support.`);
+            textContent += `\n\n[Attached image ${path.basename(file)} (${kb} KB) was not sent because the current model cannot view images.]`;
+            continue;
+          }
+          const size = fs.statSync(file).size;
+          if (size > MAX_IMAGE_BYTES) {
+            textContent += `\n\n[image ${path.basename(file)} skipped: ${(size / 1e6).toFixed(1)}MB exceeds 5MB]`;
+            continue;
+          }
+          const b64 = fs.readFileSync(file).toString("base64");
+          const mime = ext === ".jpg" ? "image/jpeg" : ext === ".svg" ? "image/svg+xml" : `image/${ext.slice(1)}`;
+          imageParts.push({ type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } });
+        } else {
+          let body = fs.readFileSync(file, "utf8");
+          if (body.length > MAX_MENTION_CHARS) body = body.slice(0, MAX_MENTION_CHARS) + "\n…[truncated]";
+          textContent += `\n\n--- Attached file: ${file} ---\n\`\`\`\n${body}\n\`\`\``;
+        }
+      } catch (err) {
+        textContent += `\n\n[could not read attachment ${path.basename(file)}: ${(err as Error).message}]`;
+      }
+    }
+
+    if (imageParts.length === 0) {
+      return { content: textContent, estimate: textContent };
+    }
+    const parts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+      { type: "text", text: textContent || "(see attached image)" },
+      ...imageParts,
+    ];
+    return { content: parts, estimate: `${textContent} [${imageParts.length} image(s)]` };
+  }
+
+  async run(userInput: string, options: RunOptions = {}): Promise<void> {
+    // Snapshot before a genuine top-level turn (not sub-agents or isolated runs).
+    if (this.subagentDepth === 0 && !this.suppressCheckpoint) {
+      this.createCheckpoint(userInput);
+    }
+
+    if (!this.runLifecycleHooks("userPromptSubmit", { prompt: userInput })) {
+      ui.warn("Prompt blocked by a userPromptSubmit hook.");
+      return;
+    }
+
+    const text = expandFileMentions(userInput, this.ctx.cwd);
+    const { content, estimate } = this.buildUserContent(text, options.attachments ?? []);
+
+    if (this.shouldAutoCompress(estimate)) {
+      ui.warn(`Context is large (~${this.estimatedContextTokens(estimate).toLocaleString()} estimated tokens); compressing before continuing.`);
       try {
         const result = await this.compressContext("auto");
         if (result.compressed) {
@@ -506,7 +614,7 @@ export class Agent {
       }
     }
 
-    this.messages.push({ role: "user", content: input });
+    this.messages.push({ role: "user", content });
 
     const supportsTools = findModel(this.config.model)?.supportsTools !== false;
     const tools = supportsTools ? toOpenAITools() : [];
@@ -619,6 +727,7 @@ export class Agent {
       if (turn.toolCalls.length === 0) {
         // Final answer reached: drop reasoning_content kept for in-flight tool calls.
         this.stripReasoningContent();
+        this.runLifecycleHooks("stop", {});
         // Show usage after final answer.
         if (this.totalUsage.totalTokens > 0) {
           ui.usage(this.totalUsage, this.config.model);
@@ -652,6 +761,147 @@ export class Agent {
       if (withReasoning.reasoning_content !== undefined) {
         delete withReasoning.reasoning_content;
       }
+    }
+  }
+
+  /** Run lifecycle hooks (sessionStart / userPromptSubmit / stop). Returns false if blocked. */
+  private runLifecycleHooks(event: "sessionStart" | "userPromptSubmit" | "stop", context: { prompt?: string }): boolean {
+    const results = runHooks(event, this.ctx.cwd, context);
+    for (const hook of results) {
+      if (hook.output || !hook.ok) ui.toolResult(`hook(${event}): ${hook.command}`, !hook.ok);
+    }
+    return !results.some((hook) => !hook.ok && hook.blocking);
+  }
+
+  /** Fire sessionStart hooks (call once when a session begins). */
+  sessionStart(): void {
+    this.runLifecycleHooks("sessionStart", {});
+  }
+
+  /** Snapshot the conversation before a turn so it can be rewound later. */
+  private createCheckpoint(label: string): void {
+    this.checkpoints.push({
+      id: ++this.checkpointSeq,
+      label: label.replace(/\s+/g, " ").trim().slice(0, 60) || "(turn)",
+      time: new Date().toISOString(),
+      messages: this.messages.slice(),
+      contextSummary: this.contextSummary,
+      backups: new Map(),
+    });
+    if (this.checkpoints.length > MAX_CHECKPOINTS) this.checkpoints.shift();
+  }
+
+  /** Record a file's pre-change content into the most recent checkpoint (first touch only). */
+  private recordFileBackup(absPath: string, previous: string | null): void {
+    const active = this.checkpoints[this.checkpoints.length - 1];
+    if (active && !active.backups.has(absPath)) active.backups.set(absPath, previous);
+  }
+
+  listCheckpoints(): CheckpointInfo[] {
+    return this.checkpoints.map((c, index) => ({
+      index,
+      label: c.label,
+      time: c.time,
+      files: c.backups.size,
+    }));
+  }
+
+  /**
+   * Rewind to checkpoint `index`: restore files edited since then (deleting ones
+   * that were created), reset the conversation to that point, and drop later checkpoints.
+   */
+  rewindTo(index: number): { ok: boolean; restoredFiles: number; messages: number } {
+    if (index < 0 || index >= this.checkpoints.length) {
+      return { ok: false, restoredFiles: 0, messages: this.messageCount() };
+    }
+    // Restore newest → target so the target's (oldest) backup wins for each path.
+    const seen = new Set<string>();
+    for (let i = this.checkpoints.length - 1; i >= index; i--) {
+      for (const [filePath, content] of this.checkpoints[i].backups) {
+        seen.add(filePath);
+        try {
+          if (content === null) {
+            if (fs.existsSync(filePath)) fs.rmSync(filePath);
+          } else {
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, content, "utf8");
+          }
+        } catch {
+          // Best-effort restore; keep going.
+        }
+      }
+    }
+
+    const target = this.checkpoints[index];
+    this.messages = target.messages.slice();
+    this.contextSummary = target.contextSummary;
+    this.checkpoints = this.checkpoints.slice(0, index);
+    this.stripReasoningContent();
+    return { ok: true, restoredFiles: seen.size, messages: this.messageCount() };
+  }
+
+  /**
+   * Run an isolated sub-agent to completion and return its final answer.
+   * The sub-agent has a fresh conversation, the standard tools (minus `task`,
+   * to prevent runaway recursion), and shares the parent's usage accounting.
+   */
+  async runSubagent(prompt: string, opts: { tools?: string[] } = {}): Promise<string> {
+    if (this.subagentDepth >= 2) {
+      return "Sub-agent depth limit reached; refusing to nest further.";
+    }
+    this.subagentDepth++;
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content:
+          systemPrompt(this.ctx.cwd, this.contextSummary) +
+          "\n\nYou are a sub-agent handling a delegated, self-contained task. Work autonomously with the available tools and finish with a concise final answer for the calling agent.",
+      },
+      { role: "user", content: prompt },
+    ];
+
+    // Sub-agents never receive the task tool; honor an optional allowlist.
+    let tools = toOpenAITools().filter((t) => t.function.name !== "task");
+    if (opts.tools && opts.tools.length > 0) {
+      const allow = new Set(opts.tools);
+      tools = tools.filter((t) => allow.has(t.function.name));
+    }
+
+    ui.info(chalk.dim("  ↳ sub-agent started"));
+    try {
+      let finalText = "";
+      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+        const turn = await this.client.stream(messages, tools, this.config.model);
+        if (turn.usage) {
+          this.totalUsage.promptTokens += turn.usage.promptTokens;
+          this.totalUsage.completionTokens += turn.usage.completionTokens;
+          this.totalUsage.totalTokens += turn.usage.totalTokens;
+        }
+
+        const assistantMsg: ChatMessage = {
+          role: "assistant",
+          content: turn.content || (turn.toolCalls.length > 0 ? null : ""),
+        };
+        if (turn.toolCalls.length > 0) {
+          assistantMsg.tool_calls = turn.toolCalls;
+          if (turn.reasoning) (assistantMsg as { reasoning_content?: string }).reasoning_content = turn.reasoning;
+        }
+        messages.push(assistantMsg);
+
+        if (turn.toolCalls.length === 0) {
+          finalText = turn.content;
+          break;
+        }
+        for (const call of turn.toolCalls) {
+          const result = await this.executeToolCall(call);
+          messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        }
+      }
+      ui.info(chalk.dim("  ↳ sub-agent done"));
+      return finalText || "(sub-agent produced no final answer)";
+    } finally {
+      this.subagentDepth--;
     }
   }
 

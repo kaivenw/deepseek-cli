@@ -6,6 +6,8 @@ export interface ModelInfo {
   id: string;
   label: string;
   supportsTools: boolean;
+  /** Whether the model accepts image input. DeepSeek chat models are text-only. */
+  supportsVision?: boolean;
   description: string;
 }
 

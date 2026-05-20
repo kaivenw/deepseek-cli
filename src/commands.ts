@@ -12,6 +12,7 @@ import {
   type ThinkingMode,
 } from "./config.js";
 import { findProjectRoot, loadProjectMemory, projectMemoryTarget } from "./project.js";
+import { addNote, clearNotes, listNotes, removeNote } from "./btw.js";
 import {
   createSkillTemplate,
   findSkillCommand,
@@ -70,6 +71,7 @@ export const COMMANDS: CommandInfo[] = [
   { name: "todos", aliases: ["todo"], usage: "/todos", description: "show the current task list" },
   { name: "thinking", usage: "/thinking [on|off|collapsed|full]", description: "toggle/set the reasoning trace display (bare = on/off)" },
   { name: "config", usage: "/config", description: "show current configuration" },
+  { name: "btw", usage: "/btw [note | list | done <n> | clear]", description: "jot down an out-of-scope idea to revisit later" },
   { name: "review", usage: "/review [ref]", description: "review local git changes (or a diff against <ref>)" },
   { name: "task", usage: "/task <prompt>", description: "run an isolated subagent-style task" },
   { name: "doctor", usage: "/doctor", description: "check environment and configuration health" },
@@ -77,6 +79,7 @@ export const COMMANDS: CommandInfo[] = [
   { name: "compress", usage: "/compress", description: "compress conversation context into a durable summary" },
   { name: "save", usage: "/save", description: "save current session to disk" },
   { name: "resume", usage: "/resume", description: "restore saved session for this project" },
+  { name: "rewind", aliases: ["undo"], usage: "/rewind [n]", description: "rewind conversation and undo file edits to a checkpoint" },
   { name: "clear", usage: "/clear", description: "clear conversation history and saved session" },
   {
     name: "exit",
@@ -268,6 +271,11 @@ export async function runCommand(input: string, ctx: CommandContext): Promise<Co
       ui.success(`Session saved (${ctx.agent.messageCount()} messages).`);
       return {};
 
+    case "rewind":
+    case "undo":
+      await handleRewind(cmd.toLowerCase() === "undo", rest.join(" ").trim(), ctx);
+      return {};
+
     case "resume": {
       const data = loadSession(ctx.agent.getCwd());
       if (!data || (data.messages.length <= 1 && !data.contextSummary)) {
@@ -278,6 +286,10 @@ export async function runCommand(input: string, ctx: CommandContext): Promise<Co
       ui.success(`Session restored (${ctx.agent.messageCount()} messages${ctx.agent.getContextSummary() ? ", compressed context active" : ""}).`);
       return {};
     }
+
+    case "btw":
+      handleBtw(rest.join(" ").trim(), ctx);
+      return {};
 
     case "review":
       await handleReview(rest.join(" ").trim(), ctx);
@@ -371,6 +383,51 @@ async function runSkillCommand(cmd: string, arg: string, ctx: CommandContext): P
   const prompt = renderSkillPrompt(skill, arg, ctx.agent.getCwd());
   await ctx.agent.run(prompt);
   return true;
+}
+
+async function handleRewind(isUndo: boolean, arg: string, ctx: CommandContext): Promise<void> {
+  const list = ctx.agent.listCheckpoints();
+  if (list.length === 0) {
+    ui.info("No checkpoints yet — nothing to rewind.");
+    return;
+  }
+
+  let targetIndex: number;
+  if (isUndo) {
+    targetIndex = list.length - 1; // undo the most recent turn
+  } else if (arg) {
+    const n = Number(arg);
+    if (!Number.isInteger(n) || n < 1 || n > list.length) {
+      ui.warn(`Usage: /rewind <1-${list.length}>  (or /rewind to choose)`);
+      return;
+    }
+    targetIndex = n - 1;
+  } else {
+    targetIndex = await select({
+      message: "Rewind to which point? This restores the conversation AND undoes file edits made since.",
+      choices: list
+        .slice()
+        .reverse()
+        .map((c) => ({
+          name: `#${c.index + 1}  ${c.label}${c.files ? chalk.dim(` · ${c.files} file(s)`) : ""}  ${chalk.dim(c.time.slice(11, 19))}`,
+          value: c.index,
+        })),
+    });
+  }
+
+  const result = ctx.agent.rewindTo(targetIndex);
+  if (!result.ok) {
+    ui.warn("Could not rewind to that checkpoint.");
+    return;
+  }
+  ui.success(
+    `Rewound to checkpoint #${targetIndex + 1}: restored ${result.restoredFiles} file(s); ${result.messages} message(s) remain.`,
+  );
+  try {
+    saveSession(ctx.agent.getCwd(), ctx.agent.getSession());
+  } catch {
+    // best-effort persistence
+  }
 }
 
 async function handleCompress(ctx: CommandContext): Promise<void> {
@@ -621,6 +678,48 @@ async function handlePlugin(args: string[]): Promise<void> {
         "Usage: /plugin <list | search [query] | new <name> | install <name|src> | remove <name> | enable <name> | disable <name> | update <name>>",
       );
   }
+}
+
+function handleBtw(arg: string, ctx: CommandContext): void {
+  const cwd = ctx.agent.getCwd();
+  const trimmed = arg.trim();
+
+  // Bare /btw or /btw list → show the backlog.
+  if (!trimmed || trimmed === "list" || trimmed === "ls") {
+    const notes = listNotes(cwd);
+    if (notes.length === 0) {
+      ui.info("No 'by the way' notes yet. Use /btw <idea> to jot one down.");
+      return;
+    }
+    console.log();
+    console.log(`  ${chalk.dim("by-the-way backlog:")}`);
+    notes.forEach((note, i) => {
+      const when = note.createdAt.slice(0, 10);
+      console.log(`  ${chalk.cyan(String(i + 1).padStart(2))}. ${note.text} ${chalk.dim(`(${when})`)}`);
+    });
+    console.log(`  ${chalk.dim("resolve with /btw done <n>, or /btw clear")}`);
+    console.log();
+    return;
+  }
+
+  if (trimmed === "clear") {
+    const count = clearNotes(cwd);
+    ui.success(`Cleared ${count} note${count === 1 ? "" : "s"}.`);
+    return;
+  }
+
+  const doneMatch = trimmed.match(/^(done|rm|remove)\s+(\d+)$/i);
+  if (doneMatch) {
+    const removed = removeNote(cwd, Number(doneMatch[2]));
+    if (removed) ui.success(`Done: ${removed.text}`);
+    else ui.warn(`No note #${doneMatch[2]}. Use /btw list to see them.`);
+    return;
+  }
+
+  // Otherwise treat the whole argument as a new note.
+  addNote(cwd, trimmed);
+  const pending = listNotes(cwd).length;
+  ui.success(`Noted for later (${pending} pending). Use /btw to review.`);
 }
 
 async function handleReview(ref: string, ctx: CommandContext): Promise<void> {

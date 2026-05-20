@@ -37,6 +37,7 @@ export const writeTool: Tool = {
 
     const existed = fs.existsSync(abs);
     const previous = existed ? fs.readFileSync(abs, "utf8") : "";
+    ctx.recordFileBackup?.(abs, existed ? previous : null);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, "utf8");
 
