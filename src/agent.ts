@@ -594,15 +594,25 @@ export class Agent {
       // 400 ("reasoning_content ... must be passed back"). We attach it here and
       // strip it once the turn concludes (see below) so stale reasoning is never
       // resent on later user turns — the other half of DeepSeek's contract.
+      const hasContent = typeof turn.content === "string" && turn.content.length > 0;
+      const hasToolCalls = turn.toolCalls.length > 0;
+
       const assistantMsg: ChatMessage = {
         role: "assistant",
-        content: turn.content || null,
+        content: hasContent ? turn.content : null,
       };
-      if (turn.toolCalls.length > 0) {
+      if (hasToolCalls) {
         assistantMsg.tool_calls = turn.toolCalls;
         if (turn.reasoning) {
           (assistantMsg as { reasoning_content?: string }).reasoning_content = turn.reasoning;
         }
+      }
+      // DeepSeek rejects assistant messages that have neither content nor
+      // tool_calls.  When both are missing (e.g. all streamed tool_calls were
+      // stripped because they lacked a function name), fall back to a sensible
+      // empty string so the message stays valid for future turns.
+      if (!assistantMsg.content && !(assistantMsg as { tool_calls?: unknown }).tool_calls) {
+        assistantMsg.content = "";
       }
       this.messages.push(assistantMsg);
 
