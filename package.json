@@ -1,5 +1,5 @@
 {
-  "name": "deepseek-cli",
+  "name": "@kavienw/deepseek-cli",
   "version": "0.1.0",
   "description": "An agentic coding CLI for DeepSeek models, in the spirit of Claude Code",
   "type": "module",
@@ -16,7 +16,9 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "deepseek",
@@ -26,6 +28,9 @@
     "coding-assistant"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@inquirer/prompts": "^7.2.0",
     "chalk": "^5.3.0",
