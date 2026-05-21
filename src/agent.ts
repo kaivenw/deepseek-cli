@@ -5,7 +5,7 @@ import path from "node:path";
 import { DeepSeekClient, type ChatMessage, type ListedModel, type ToolCall, type Usage } from "./client.js";
 import { getTool, toOpenAITools, type ToolContext } from "./tools/index.js";
 import { findModel, saveConfig, type Config, type ThinkingMode } from "./config.js";
-import type { PermissionManager } from "./permissions.js";
+import type { PermissionManager, PermissionMode } from "./permissions.js";
 import { formatProjectMemoryForPrompt } from "./project.js";
 import { ui, chalk, Spinner } from "./ui/render.js";
 import { TodoStore, type TodoItem } from "./todo.js";
@@ -47,6 +47,8 @@ export interface GenerationInputController {
   start(): void;
   stop(): void;
   handleKeypress(str: string, key: KeypressKey): void;
+  /** Esc with queued messages un-queues instead of interrupting. Returns true if it consumed Esc. */
+  handleEscape?(): boolean;
   beforeOutput?(): void;
   afterOutput?(): void;
   setStatus?(status: string): void;
@@ -367,6 +369,15 @@ export class Agent {
     return this.config.thinkingMode ?? "off";
   }
 
+  getPermissionMode(): PermissionMode {
+    return this.permissions.getMode();
+  }
+
+  /** Advance the permission mode (default → acceptEdits → plan) and return the new mode. */
+  cyclePermissionMode(): PermissionMode {
+    return this.permissions.cycleMode();
+  }
+
   getCwd(): string {
     return this.ctx.cwd;
   }
@@ -523,7 +534,14 @@ export class Agent {
     const input = process.stdin as RawInput;
     const wasRaw = Boolean(input.isRaw);
     const onKeypress = (_str: string, key: KeypressKey = {}) => {
-      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+      // Ctrl+C always interrupts the running generation.
+      if (key.ctrl && key.name === "c") {
+        controller.abort();
+        return;
+      }
+      // Esc: with queued messages, un-queue (Claude Code v2.1); otherwise interrupt.
+      if (key.name === "escape") {
+        if (generationInput?.handleEscape?.()) return;
         controller.abort();
         return;
       }
@@ -549,7 +567,12 @@ export class Agent {
     const input = process.stdin as RawInput;
     const wasRaw = Boolean(input.isRaw);
     const onKeypress = (str: string, key: KeypressKey = {}) => {
-      if (key.name === "escape" || (key.ctrl && key.name === "c")) return;
+      if (key.ctrl && key.name === "c") return; // can't interrupt a running tool here
+      // Esc un-queues a pending message while a tool runs (no interrupt available here).
+      if (key.name === "escape") {
+        generationInput.handleEscape?.();
+        return;
+      }
       generationInput.handleKeypress(str, key);
     };
 
@@ -997,16 +1020,28 @@ export class Agent {
     ui.toolCall(preview);
     generationInput?.afterOutput?.();
 
-    // Permission gate for side-effecting tools.
-    if (tool.needsApproval && !this.permissions.isAllowed(tool.name)) {
-      generationInput?.beforeOutput?.();
-      const decision = await this.permissions.request(tool.name, preview);
-      generationInput?.afterOutput?.();
-      if (decision === "deny") {
+    // Permission gate for side-effecting tools (respects the current permission mode).
+    if (tool.needsApproval) {
+      const verdict = this.permissions.evaluate(tool.name);
+      if (verdict === "deny") {
+        const planMode = this.permissions.getMode() === "plan";
         generationInput?.beforeOutput?.();
-        ui.toolResult("denied by user", true);
+        ui.toolResult(planMode ? "skipped — plan mode (read-only)" : "denied by user", true);
         generationInput?.afterOutput?.();
-        return "User denied permission to run this tool. Do not retry; ask the user how to proceed or try a different approach.";
+        return planMode
+          ? "Plan mode is active: file edits and shell commands are disabled. Do NOT call write_file/edit_file/bash or any other side-effecting tool. Instead, lay out a clear step-by-step plan and wait for the user to approve."
+          : "User denied permission to run this tool. Do not retry; ask the user how to proceed or try a different approach.";
+      }
+      if (verdict === "ask") {
+        generationInput?.beforeOutput?.();
+        const decision = await this.permissions.request(tool.name, preview);
+        generationInput?.afterOutput?.();
+        if (decision === "deny") {
+          generationInput?.beforeOutput?.();
+          ui.toolResult("denied by user", true);
+          generationInput?.afterOutput?.();
+          return "User denied permission to run this tool. Do not retry; ask the user how to proceed or try a different approach.";
+        }
       }
     }
 

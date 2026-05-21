@@ -45,7 +45,8 @@ export const readTool: Tool = {
     }
 
     const raw = fs.readFileSync(abs, "utf8");
-    const allLines = raw.split("\n");
+    // Drop the empty element a trailing newline produces so line counts are accurate.
+    const allLines = raw.length === 0 ? [] : raw.replace(/\n$/, "").split("\n");
     const offset = args.offset ? Math.max(1, Number(args.offset)) : 1;
     const limit = args.limit ? Number(args.limit) : MAX_LINES;
     const slice = allLines.slice(offset - 1, offset - 1 + limit);

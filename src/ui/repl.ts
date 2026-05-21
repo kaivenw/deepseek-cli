@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import readline from "node:readline";
+import fs from "node:fs";
 import type { Agent, GenerationInputController } from "../agent.js";
 import type { Config } from "../config.js";
 import { isCommand, runCommand, suggestCommands } from "../commands.js";
@@ -9,11 +10,27 @@ import { appendProjectMemory } from "../project.js";
 import { extractDraggedPaths } from "../attachments.js";
 import path from "node:path";
 import { mcpStatus } from "../mcp.js";
+import { permissionModeLabel } from "../permissions.js";
 
-interface CommandSuggestion {
-  value: string;
-  usage: string;
-  description: string;
+/** Lets the input editor display & cycle the permission mode via Shift+Tab. */
+interface ModeController {
+  /** Display label for the current mode, or "" when in the default/normal mode. */
+  label(): string;
+  /** Advance to the next permission mode. */
+  cycle(): void;
+}
+
+type CompletionKind = "command" | "file" | "none";
+
+interface Completion {
+  /** Display label, e.g. "/model" or "@src/app.ts". */
+  label: string;
+  /** Secondary description (commands only). */
+  detail: string;
+  /** Text spliced into the line in place of [start, end). */
+  replacement: string;
+  start: number;
+  end: number;
 }
 
 interface PromptRenderState {
@@ -66,26 +83,119 @@ function physicalRows(text: string, cols: number): number {
     .reduce((rows, line) => rows + Math.max(1, Math.ceil(displayWidth(line) / cols)), 0);
 }
 
-function commandSuggestions(line: string, cwd: string): CommandSuggestion[] {
-  const trimmedStart = line.trimStart();
-  if (!trimmedStart.startsWith("/")) return [];
+// --- File index for @-mention completion (bounded, cached) ---
+const FILE_INDEX_TTL_MS = 5000;
+const FILE_INDEX_CAP = 8000;
+const FILE_INDEX_IGNORE = new Set([
+  "node_modules", ".git", "dist", "build", ".next", "target", ".idea", ".cache", "coverage",
+]);
+let fileIndexCache: { cwd: string; files: string[]; time: number } | null = null;
 
-  const query = trimmedStart.slice(1);
-  const commands = suggestCommands(query, { limit: 8, cwd });
-  return commands.map((command) => ({
-    value: command.usage.split(" ")[0],
-    usage: command.usage,
-    description: command.description,
-  }));
+function indexProjectFiles(cwd: string): string[] {
+  const now = Date.now();
+  if (fileIndexCache && fileIndexCache.cwd === cwd && now - fileIndexCache.time < FILE_INDEX_TTL_MS) {
+    return fileIndexCache.files;
+  }
+  const files: string[] = [];
+  const walk = (dir: string, rel: string): void => {
+    if (files.length >= FILE_INDEX_CAP) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= FILE_INDEX_CAP) return;
+      const childRel = rel ? rel + "/" + entry.name : entry.name;
+      if (entry.isDirectory()) {
+        if (!FILE_INDEX_IGNORE.has(entry.name)) walk(path.join(dir, entry.name), childRel);
+      } else if (entry.isFile()) {
+        files.push(childRel);
+      }
+    }
+  };
+  walk(cwd, "");
+  fileIndexCache = { cwd, files, time: now };
+  return files;
 }
 
-function commandSuggestionRows(suggestions: CommandSuggestion[], selectedIndex: number): string[] {
-  return suggestions.map((suggestion, index) => {
-    const usage = suggestion.usage.padEnd(14);
+export function fuzzyFileMatch(files: string[], query: string, limit: number): string[] {
+  if (!query) return files.slice(0, limit);
+  const q = query.toLowerCase();
+  const scored: { file: string; score: number }[] = [];
+  for (const file of files) {
+    const lower = file.toLowerCase();
+    const base = lower.slice(lower.lastIndexOf("/") + 1);
+    let score = -1;
+    if (base.startsWith(q)) score = 120 - base.length;
+    else if (lower.startsWith(q)) score = 100 - lower.length;
+    else if (base.includes(q)) score = 80 - base.indexOf(q);
+    else if (lower.includes(q)) score = 60 - lower.indexOf(q);
+    else {
+      let qi = 0;
+      for (const ch of lower) {
+        if (ch === q[qi]) qi++;
+        if (qi === q.length) break;
+      }
+      if (qi === q.length) score = 30 - (lower.length - q.length);
+    }
+    if (score > -1) scored.push({ file, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.file.length - b.file.length);
+  return scored.slice(0, limit).map((s) => s.file);
+}
+
+/** The @-mention token under the cursor, or null. */
+export function atTokenRange(line: string, cursor: number): { start: number; query: string } | null {
+  let start = cursor;
+  while (start > 0 && !/\s/.test(line[start - 1])) start--;
+  const token = line.slice(start, cursor);
+  if (!token.startsWith("@")) return null;
+  return { start, query: token.slice(1) };
+}
+
+/** Completions for the current line: slash commands, or @-mention files. */
+export function getCompletions(line: string, cursor: number, cwd: string): { kind: CompletionKind; items: Completion[] } {
+  const trimmedStart = line.trimStart();
+  if (trimmedStart.startsWith("/")) {
+    const commands = suggestCommands(trimmedStart.slice(1), { limit: 8, cwd });
+    return {
+      kind: "command",
+      items: commands.map((c) => ({
+        label: c.usage,
+        detail: c.description,
+        replacement: c.usage.split(" ")[0],
+        start: 0,
+        end: line.length,
+      })),
+    };
+  }
+  const at = atTokenRange(line, cursor);
+  if (at) {
+    const files = fuzzyFileMatch(indexProjectFiles(cwd), at.query, 8);
+    if (files.length > 0) {
+      return {
+        kind: "file",
+        items: files.map((f) => ({
+          label: "@" + f,
+          detail: "",
+          replacement: "@" + f + " ",
+          start: at.start,
+          end: cursor,
+        })),
+      };
+    }
+  }
+  return { kind: "none", items: [] };
+}
+
+function completionRows(items: Completion[], selectedIndex: number): string[] {
+  return items.map((item, index) => {
     const selected = index === selectedIndex;
-    const left = selected ? chalk.cyan(usage) : chalk.dim(usage);
-    const description = selected ? chalk.white(suggestion.description) : chalk.dim(suggestion.description);
-    return "  " + left + " " + description;
+    const label = (selected ? chalk.cyan : chalk.dim)(item.label.padEnd(14));
+    const detail = item.detail ? " " + (selected ? chalk.white : chalk.dim)(item.detail) : "";
+    return "  " + label + detail;
   });
 }
 
@@ -98,7 +208,7 @@ interface RenderGeometry {
 
 const EMPTY_GEOMETRY: RenderGeometry = { rows: 0, cursorRow: 0 };
 
-class QueuedInputController implements GenerationInputController {
+export class QueuedInputController implements GenerationInputController {
   private line = "";
   private cursor = 0;
   private geom: RenderGeometry = { ...EMPTY_GEOMETRY };
@@ -113,6 +223,10 @@ class QueuedInputController implements GenerationInputController {
   start(): void {
     if (this.active || !process.stdout.isTTY) return;
     this.active = true;
+    // INVARIANT: while the controller is active, nothing else may write to stdout
+    // outside of beforeOutput()/afterOutput(). The agent only starts the controller
+    // during the idle wait and tool awaits, and stops it before streaming reasoning
+    // /answer text — so this animation timer never interleaves with other output.
     this.animationTimer = setInterval(() => {
       this.frame++;
       this.repaint();
@@ -161,6 +275,31 @@ class QueuedInputController implements GenerationInputController {
   setStatus(status: string): void {
     this.status = status;
     this.repaint();
+  }
+
+  /**
+   * Esc with queued messages (Claude Code v2.1): move the most recent queued
+   * message back into the input instead of interrupting. Returns true if it
+   * consumed the Esc (so the caller should NOT interrupt); false if nothing was
+   * queued (caller interrupts).
+   */
+  handleEscape(): boolean {
+    if (!this.active || this.queue.length === 0) return false;
+    this.editLastQueued();
+    return true;
+  }
+
+  private editLastQueued(): void {
+    if (this.queue.length === 0) return;
+    const last = this.queue.pop() ?? "";
+    // Prepend any in-progress draft so nothing typed is lost.
+    this.line = this.line ? `${last} ${this.line}` : last;
+    this.cursor = this.line.length;
+    this.repaint();
+  }
+
+  private truncate(text: string, max: number): string {
+    return text.length > max ? text.slice(0, max - 1) + "…" : text;
   }
 
   handleKeypress(str: string, key: readline.Key): void {
@@ -214,6 +353,11 @@ class QueuedInputController implements GenerationInputController {
       this.repaint();
       return;
     }
+    // Up: pull the most recent queued message back into the input to edit it.
+    if (key.name === "up") {
+      this.editLastQueued();
+      return;
+    }
     if (key.ctrl || key.meta) return;
     if (!str) return;
 
@@ -236,13 +380,19 @@ class QueuedInputController implements GenerationInputController {
     if (!this.active) return;
     const dots = ".".repeat((this.frame % 3) + 1);
     const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}`;
-    const tipLine = "  " + chalk.dim("enter queues next message · esc interrupts");
+    const queuedLines = this.queue.map(
+      (msg, i) => "  " + chalk.dim(`⏳ ${i + 1}. ${this.truncate(msg, 64)}`),
+    );
+    const tipLine = this.queue.length > 0
+      ? "  " + chalk.dim("enter queues · ↑ edit queued · esc un-queues · ctrl+c interrupts")
+      : "  " + chalk.dim("enter queues next message · esc interrupts");
     const divider = chalk.dim("─".repeat(Math.min(process.stdout.columns || 60, 60)));
+    const header = [loadingLine, ...queuedLines, tipLine, divider].join("\n");
     this.geom = renderPrompt(
       {
         line: this.line,
         cursor: this.cursor,
-        promptText: `${loadingLine}\n${tipLine}\n${divider}\n${chalk.bold.green("› ")}`,
+        promptText: `${header}\n${chalk.bold.green("› ")}`,
         suggestionRows: [],
       },
       this.geom,
@@ -314,7 +464,7 @@ function fallbackAsk(promptText: string, history: string[]): Promise<string | nu
   });
 }
 
-function readInteractiveLine(promptText: string, history: string[], cwd: string, initialLine = ""): Promise<string | null> {
+function readInteractiveLine(promptText: string, history: string[], cwd: string, initialLine = "", modeProvider?: ModeController): Promise<string | null> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return fallbackAsk(promptText, history);
   }
@@ -328,12 +478,32 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
     let historyIndex = history.length;
     let draftLine = "";
     let selectedSuggestion = 0;
+    let ctrlCArmed = false;
+    let escArmed = false;
+    let hint = "";
+    let armTimer: ReturnType<typeof setTimeout> | null = null;
     const wasRaw = process.stdin.isRaw;
+
+    const disarm = () => {
+      ctrlCArmed = false;
+      escArmed = false;
+      hint = "";
+      if (armTimer) { clearTimeout(armTimer); armTimer = null; }
+    };
+    const arm = (which: "ctrlc" | "esc", message: string) => {
+      ctrlCArmed = which === "ctrlc";
+      escArmed = which === "esc";
+      hint = message;
+      if (armTimer) clearTimeout(armTimer);
+      armTimer = setTimeout(() => { disarm(); repaint(); }, 2500);
+      repaint();
+    };
 
     const finish = (value: string | null) => {
       if (settled) return;
       settled = true;
       if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
+      if (armTimer) { clearTimeout(armTimer); armTimer = null; }
       process.stdin.off("keypress", onKeypress);
       if (!wasRaw) process.stdin.setRawMode(false);
       clearRendered(geom);
@@ -341,26 +511,29 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
       resolve(value);
     };
 
-    const currentSuggestions = () => commandSuggestions(line, cwd);
+    const completions = () => getCompletions(line, cursor, cwd);
 
-    const applySuggestion = () => {
-      const suggestions = currentSuggestions();
-      const suggestion = suggestions[selectedSuggestion];
-      if (!suggestion) return false;
-      setLine(suggestion.value);
-      return true;
+    const applyCompletion = (item: Completion) => {
+      line = line.slice(0, item.start) + item.replacement + line.slice(item.end);
+      cursor = item.start + item.replacement.length;
+      selectedSuggestion = 0;
+      repaint();
     };
 
     const repaint = () => {
       if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
-      const suggestions = currentSuggestions();
-      if (selectedSuggestion >= suggestions.length) selectedSuggestion = Math.max(0, suggestions.length - 1);
+      const { items } = completions();
+      if (selectedSuggestion >= items.length) selectedSuggestion = Math.max(0, items.length - 1);
+      const rows = completionRows(items, selectedSuggestion);
+      const modeLabel = modeProvider?.label() ?? "";
+      if (modeLabel) rows.push(chalk.yellow("  ⏵⏵ " + modeLabel) + chalk.dim("  ·  shift+tab to cycle"));
+      if (hint) rows.push(chalk.dim("  " + hint));
       geom = renderPrompt(
         {
           line,
           cursor,
           promptText,
-          suggestionRows: commandSuggestionRows(suggestions, selectedSuggestion),
+          suggestionRows: rows,
         },
         geom,
       );
@@ -384,13 +557,49 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
     };
 
     const onKeypress = (str: string, key: readline.Key) => {
+      // Ctrl+C: clear a non-empty line; on an empty line, require a second press to exit.
       if (key.ctrl && key.name === "c") {
-        finish(null);
+        if (line.length > 0) {
+          line = "";
+          cursor = 0;
+          disarm();
+          repaint();
+          return;
+        }
+        if (ctrlCArmed) {
+          disarm();
+          finish(null);
+          return;
+        }
+        arm("ctrlc", "press Ctrl+C again to exit");
         return;
       }
+      // Esc: clear a non-empty line; on an empty line, double-Esc opens rewind.
+      if (key.name === "escape" && !key.ctrl && !key.meta) {
+        if (line.length > 0) {
+          line = "";
+          cursor = 0;
+          disarm();
+          repaint();
+          return;
+        }
+        if (escArmed) {
+          disarm();
+          finish("/rewind");
+          return;
+        }
+        arm("esc", "press Esc again to rewind / edit a previous step");
+        return;
+      }
+      // Any other key cancels a pending Ctrl+C / Esc arming.
+      if (ctrlCArmed || escArmed) disarm();
       if (key.name === "return" || key.name === "enter") {
-        if (currentSuggestions().length > 0 && applySuggestion()) {
-          finish(line);
+        const { kind, items } = completions();
+        const item = items[selectedSuggestion];
+        if (item) {
+          applyCompletion(item);
+          // File picks keep editing; command picks submit immediately.
+          if (kind === "command") finish(line);
           return;
         }
         finish(line);
@@ -436,9 +645,9 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
         return;
       }
       if (key.name === "up") {
-        const suggestions = currentSuggestions();
-        if (suggestions.length > 0) {
-          selectedSuggestion = (selectedSuggestion - 1 + suggestions.length) % suggestions.length;
+        const items = completions().items;
+        if (items.length > 0) {
+          selectedSuggestion = (selectedSuggestion - 1 + items.length) % items.length;
           repaint();
           return;
         }
@@ -449,9 +658,9 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
         return;
       }
       if (key.name === "down") {
-        const suggestions = currentSuggestions();
-        if (suggestions.length > 0) {
-          selectedSuggestion = (selectedSuggestion + 1) % suggestions.length;
+        const items = completions().items;
+        if (items.length > 0) {
+          selectedSuggestion = (selectedSuggestion + 1) % items.length;
           repaint();
           return;
         }
@@ -460,8 +669,16 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
         setLine(historyIndex === history.length ? draftLine : history[historyIndex] ?? "");
         return;
       }
+      if (key.name === "tab" && key.shift) {
+        if (modeProvider) {
+          modeProvider.cycle();
+          repaint();
+        }
+        return;
+      }
       if (key.name === "tab") {
-        applySuggestion();
+        const items = completions().items;
+        if (items[selectedSuggestion]) applyCompletion(items[selectedSuggestion]);
         return;
       }
       if (key.ctrl || key.meta) return;
@@ -490,7 +707,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
  * Read multi-line input. A trailing backslash continues onto the next line.
  * The continuation prompt is "... " to visually indicate more input is expected.
  */
-async function readMultiline(history: string[], initialLine = ""): Promise<string | null> {
+async function readMultiline(history: string[], initialLine = "", modeProvider?: ModeController): Promise<string | null> {
   const lines: string[] = [];
   let first = true;
 
@@ -499,7 +716,7 @@ async function readMultiline(history: string[], initialLine = ""): Promise<strin
     const promptText = first
       ? chalk.bold.green("› ")
       : chalk.dim("... ");
-    const line = await readInteractiveLine(promptText, first ? history : [], process.cwd(), first ? initialLine : "");
+    const line = await readInteractiveLine(promptText, first ? history : [], process.cwd(), first ? initialLine : "", modeProvider);
     if (line === null) {
       return first ? null : lines.join("\n");
     }
@@ -574,6 +791,11 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
   const queuedInputs: string[] = [];
   const generationInput = new QueuedInputController(queuedInputs);
   let queuedDraft = "";
+
+  const modeProvider: ModeController = {
+    label: () => (agent.getPermissionMode() === "default" ? "" : permissionModeLabel(agent.getPermissionMode())),
+    cycle: () => { agent.cyclePermissionMode(); },
+  };
 
   const handleInput = async (input: string): Promise<boolean> => {
     if (!input) return true;
@@ -663,7 +885,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
     } else {
       queuedDraft = generationInput.takeDraft() || queuedDraft;
       try {
-        input = await readMultiline(history, queuedDraft);
+        input = await readMultiline(history, queuedDraft, modeProvider);
         queuedDraft = "";
       } catch (err) {
         if (isAbortError(err)) {

@@ -100,13 +100,22 @@ async function ensureApiKey(config: Config): Promise<boolean> {
 }
 
 process.once("exit", () => shutdownMcp());
+// Also tear down MCP child processes on termination signals (exit handlers don't
+// run on signal-caused termination). Raw-mode REPL input handles Ctrl-C itself,
+// so these mainly cover one-shot / piped runs and external kills.
+for (const sig of ["SIGTERM", "SIGHUP"] as const) {
+  process.on(sig, () => {
+    shutdownMcp();
+    process.exit(130);
+  });
+}
 
 async function main(): Promise<void> {
   const program = new Command();
   program
     .name("deepseek")
     .description("An agentic coding CLI for DeepSeek models")
-    .version("0.1.7")
+    .version("0.1.8")
     .argument("[prompt...]", "run a one-shot prompt instead of the interactive REPL")
     .option("-m, --model <model>", "model to use (e.g. deepseek-v4-pro, deepseek-v4-flash)")
     .option("-p, --print", "print mode: run the prompt once and exit")

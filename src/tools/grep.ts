@@ -5,9 +5,14 @@ import type { Tool, ToolContext } from "./types.js";
 
 const MAX_RESULTS = 200;
 
+let ripgrepAvailable: boolean | undefined;
 function hasRipgrep(): Promise<boolean> {
+  if (ripgrepAvailable !== undefined) return Promise.resolve(ripgrepAvailable);
   return new Promise((resolve) => {
-    execFile("rg", ["--version"], (err) => resolve(!err));
+    execFile("rg", ["--version"], (err) => {
+      ripgrepAvailable = !err;
+      resolve(ripgrepAvailable);
+    });
   });
 }
 
