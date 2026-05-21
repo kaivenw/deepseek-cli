@@ -53,6 +53,8 @@ export interface Config {
   alwaysAllow: string[];
   /** How the model's reasoning/thinking trace is displayed (off | collapsed | full). */
   thinkingMode: ThinkingMode;
+  /** True after the user explicitly persists a thinking display preference. */
+  thinkingModeConfigured?: boolean;
   /** True when the key came from the environment — don't persist it to disk. */
   apiKeyFromEnv?: boolean;
 }
@@ -64,7 +66,7 @@ const DEFAULTS: Config = {
   baseURL: DEFAULT_BASE_URL,
   model: DEFAULT_MODEL,
   alwaysAllow: [],
-  thinkingMode: "collapsed",
+  thinkingMode: "off",
 };
 
 export function loadConfig(): Config {
@@ -77,11 +79,15 @@ export function loadConfig(): Config {
     // Corrupt config: fall back to defaults rather than crashing.
   }
 
+  const savedThinkingMode = normalizeThinkingMode(fileConfig.thinkingMode);
+  const thinkingModeConfigured = fileConfig.thinkingModeConfigured === true;
+
   const config: Config = {
     ...DEFAULTS,
     ...fileConfig,
     alwaysAllow: fileConfig.alwaysAllow ?? [],
-    thinkingMode: normalizeThinkingMode(fileConfig.thinkingMode) ?? DEFAULTS.thinkingMode,
+    thinkingMode: thinkingModeConfigured ? (savedThinkingMode ?? DEFAULTS.thinkingMode) : DEFAULTS.thinkingMode,
+    thinkingModeConfigured,
   };
 
   // Environment variables take precedence over the stored file.
@@ -111,8 +117,11 @@ export function saveConfig(config: Config): void {
     baseURL: config.baseURL,
     model: config.model,
     alwaysAllow: config.alwaysAllow,
-    thinkingMode: config.thinkingMode,
   };
+  if (config.thinkingModeConfigured) {
+    toStore.thinkingMode = config.thinkingMode;
+    toStore.thinkingModeConfigured = true;
+  }
   // Never write an environment-provided key to disk.
   if (config.apiKey && !config.apiKeyFromEnv) toStore.apiKey = config.apiKey;
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(toStore, null, 2), "utf8");

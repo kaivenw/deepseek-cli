@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { execSync } from "node:child_process";
 import { select } from "@inquirer/prompts";
-import type { Agent } from "./agent.js";
+import type { Agent, GenerationInputController } from "./agent.js";
 import {
   MODELS,
   findModel,
@@ -47,6 +47,7 @@ export interface CommandResult {
 export interface CommandContext {
   agent: Agent & { listModels(): Promise<{ id: string }[]> };
   config: Config;
+  generationInput?: GenerationInputController;
 }
 
 export interface CommandInfo {
@@ -381,7 +382,7 @@ async function runSkillCommand(cmd: string, arg: string, ctx: CommandContext): P
   if (!skill) return false;
 
   const prompt = renderSkillPrompt(skill, arg, ctx.agent.getCwd());
-  await ctx.agent.run(prompt);
+  await ctx.agent.run(prompt, { generationInput: ctx.generationInput });
   return true;
 }
 
@@ -501,7 +502,7 @@ async function handleInit(ctx: CommandContext): Promise<void> {
   }
   ui.info("You'll be asked to approve the file write.");
 
-  await ctx.agent.run(buildInitPrompt(root, target, exists));
+  await ctx.agent.run(buildInitPrompt(root, target, exists), { generationInput: ctx.generationInput });
 
   // Pull the freshly written DEEPSEEK.md into the active system prompt.
   ctx.agent.reloadProjectContext();
@@ -760,7 +761,7 @@ async function handleReview(ref: string, ctx: CommandContext): Promise<void> {
     "```",
   ].join("\n");
 
-  await ctx.agent.run(prompt);
+  await ctx.agent.run(prompt, { generationInput: ctx.generationInput });
 }
 
 async function handleTask(prompt: string, ctx: CommandContext): Promise<void> {
@@ -774,7 +775,7 @@ async function handleTask(prompt: string, ctx: CommandContext): Promise<void> {
     "Do not assume access to the parent conversation beyond project memory, compressed context, and this prompt.",
     "",
     prompt,
-  ].join("\n"));
+  ].join("\n"), { generationInput: ctx.generationInput });
 }
 
 function checkCommand(command: string): string | null {
@@ -980,6 +981,7 @@ function handleThinking(arg: string, ctx: CommandContext): void {
   }
 
   ctx.config.thinkingMode = next;
+  ctx.config.thinkingModeConfigured = true;
   ctx.agent.setThinkingMode(next);
   const label = next === "off" ? "off (hidden)" : next === "collapsed" ? "collapsed (first lines)" : "full";
   ui.success(`Thinking display: ${chalk.green(label)}.`);

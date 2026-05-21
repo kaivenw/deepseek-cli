@@ -39,6 +39,16 @@ export interface CheckpointInfo {
 export interface RunOptions {
   /** Absolute file paths to attach (e.g. dragged into the terminal). */
   attachments?: string[];
+  /** Optional live input collector used by the REPL while a model response is streaming. */
+  generationInput?: GenerationInputController;
+}
+
+export interface GenerationInputController {
+  start(): void;
+  stop(): void;
+  handleKeypress(str: string, key: KeypressKey): void;
+  beforeOutput?(): void;
+  afterOutput?(): void;
 }
 
 type UserContent = string | OpenAI.Chat.Completions.ChatCompletionContentPart[];
@@ -322,6 +332,7 @@ export class Agent {
     const toolCtx: ToolContext = { ...ctx };
     toolCtx.setThinkingMode = (mode: ThinkingMode) => {
       this.config.thinkingMode = mode;
+      this.config.thinkingModeConfigured = true;
       try {
         saveConfig(this.config);
       } catch {
@@ -348,6 +359,7 @@ export class Agent {
 
   setThinkingMode(mode: ThinkingMode): void {
     this.config.thinkingMode = mode;
+    this.config.thinkingModeConfigured = true;
   }
 
   getThinkingMode(): ThinkingMode {
@@ -504,7 +516,7 @@ export class Agent {
     }
   }
 
-  private listenForGenerationAbort(controller: AbortController): () => void {
+  private listenForGenerationAbort(controller: AbortController, generationInput?: GenerationInputController): () => void {
     if (!process.stdin.isTTY || !process.stdout.isTTY) return () => undefined;
 
     const input = process.stdin as RawInput;
@@ -512,27 +524,54 @@ export class Agent {
     const onKeypress = (_str: string, key: KeypressKey = {}) => {
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
         controller.abort();
+        return;
       }
+      generationInput?.handleKeypress(_str, key);
     };
 
     readline.emitKeypressEvents(input);
     input.setRawMode?.(true);
     input.on("keypress", onKeypress);
     input.resume();
+    generationInput?.start();
 
     return () => {
       input.off("keypress", onKeypress);
       if (!wasRaw) input.setRawMode?.(false);
+      generationInput?.stop();
     };
   }
 
-  async runIsolated(userInput: string): Promise<void> {
+  private listenForQueuedInput(generationInput?: GenerationInputController): () => void {
+    if (!generationInput || !process.stdin.isTTY || !process.stdout.isTTY) return () => undefined;
+
+    const input = process.stdin as RawInput;
+    const wasRaw = Boolean(input.isRaw);
+    const onKeypress = (str: string, key: KeypressKey = {}) => {
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) return;
+      generationInput.handleKeypress(str, key);
+    };
+
+    readline.emitKeypressEvents(input);
+    input.setRawMode?.(true);
+    input.on("keypress", onKeypress);
+    input.resume();
+    generationInput.start();
+
+    return () => {
+      input.off("keypress", onKeypress);
+      if (!wasRaw) input.setRawMode?.(false);
+      generationInput.stop();
+    };
+  }
+
+  async runIsolated(userInput: string, options: RunOptions = {}): Promise<void> {
     const savedMessages = this.messages;
     this.messages = [];
     this.suppressCheckpoint = true;
     this.refreshSystemPrompt();
     try {
-      await this.run(userInput);
+      await this.run(userInput, options);
     } finally {
       this.suppressCheckpoint = false;
       this.messages = savedMessages;
@@ -631,11 +670,12 @@ export class Agent {
       let reasoningLines = 1;
       let reasoningCut = false;
       const spinner = new Spinner("thinking…");
-      spinner.start();
+      if (!options.generationInput) spinner.start();
 
       // Reasoning is always captured for the API contract (see client.stream);
       // these callbacks only control how/whether it is displayed.
       const printReasoning = (delta: string) => {
+        options.generationInput?.beforeOutput?.();
         if (!reasoningStarted) {
           spinner.stop();
           process.stdout.write(chalk.dim.italic("\n  [thinking] "));
@@ -643,10 +683,14 @@ export class Agent {
         }
         if (thinkingMode === "full") {
           process.stdout.write(chalk.dim.italic(delta.replace(/\n/g, "\n  ")));
+          options.generationInput?.afterOutput?.();
           return;
         }
         // collapsed: show only the first few lines, then stop printing the rest.
-        if (reasoningCut) return;
+        if (reasoningCut) {
+          options.generationInput?.afterOutput?.();
+          return;
+        }
         const segments = delta.split("\n");
         for (let i = 0; i < segments.length; i++) {
           if (i > 0) {
@@ -654,28 +698,33 @@ export class Agent {
             if (reasoningLines > COLLAPSED_REASONING_LINES) {
               process.stdout.write(chalk.dim.italic(" …"));
               reasoningCut = true;
+              options.generationInput?.afterOutput?.();
               return;
             }
             process.stdout.write("\n  ");
           }
           if (segments[i]) process.stdout.write(chalk.dim.italic(segments[i]));
         }
+        options.generationInput?.afterOutput?.();
       };
 
       const abortController = new AbortController();
-      const stopAbortListener = this.listenForGenerationAbort(abortController);
+      const stopAbortListener = this.listenForGenerationAbort(abortController, options.generationInput);
       let turn;
       try {
         turn = await this.client.stream(this.messages, tools, this.config.model, {
           onReasoning: thinkingMode === "off" ? undefined : printReasoning,
           onText: (delta) => {
             if (!textStarted) {
+              options.generationInput?.beforeOutput?.();
               spinner.stop();
               if (reasoningStarted) process.stdout.write("\n");
               ui.assistantLabel();
               textStarted = true;
             }
+            options.generationInput?.beforeOutput?.();
             process.stdout.write(delta);
+            options.generationInput?.afterOutput?.();
           },
         }, { signal: abortController.signal });
       } catch (err) {
@@ -742,7 +791,7 @@ export class Agent {
 
       // Execute each requested tool call and feed results back.
       for (const call of turn.toolCalls) {
-        const result = await this.executeToolCall(call);
+        const result = await this.executeToolCall(call, options.generationInput);
         this.messages.push({
           role: "tool",
           tool_call_id: call.id,
@@ -932,6 +981,7 @@ export class Agent {
 
   private async executeToolCall(
     call: ToolCall,
+    generationInput?: GenerationInputController,
   ): Promise<string> {
     const tool = getTool(call.function.name);
     if (!tool) {
@@ -948,30 +998,43 @@ export class Agent {
     }
 
     const preview = tool.preview ? tool.preview(args, this.ctx) : tool.name;
+    generationInput?.beforeOutput?.();
     ui.toolCall(preview);
+    generationInput?.afterOutput?.();
 
     // Permission gate for side-effecting tools.
     if (tool.needsApproval && !this.permissions.isAllowed(tool.name)) {
+      generationInput?.beforeOutput?.();
       const decision = await this.permissions.request(tool.name, preview);
+      generationInput?.afterOutput?.();
       if (decision === "deny") {
+        generationInput?.beforeOutput?.();
         ui.toolResult("denied by user", true);
+        generationInput?.afterOutput?.();
         return "User denied permission to run this tool. Do not retry; ask the user how to proceed or try a different approach.";
       }
     }
 
+    const stopQueuedInput = this.listenForQueuedInput(generationInput);
     try {
       const preHooks = runHooks("preToolUse", this.ctx.cwd, { toolName: tool.name, preview });
       for (const hook of preHooks) {
+        generationInput?.beforeOutput?.();
         ui.toolResult(`hook: ${hook.command}`, !hook.ok);
+        generationInput?.afterOutput?.();
       }
       const blockingHook = preHooks.find((hook) => !hook.ok && hook.blocking);
       if (blockingHook) {
+        stopQueuedInput();
         return `Tool blocked by preToolUse hook.\n${renderHookRuns(preHooks)}`;
       }
 
       const result = await tool.run(args, this.ctx);
+      stopQueuedInput();
+      generationInput?.beforeOutput?.();
       ui.toolResult(result.summary ?? tool.name, Boolean(result.isError));
       if (result.display) ui.diff(result.display);
+      generationInput?.afterOutput?.();
 
       const postHooks = runHooks("postToolUse", this.ctx.cwd, {
         toolName: tool.name,
@@ -979,14 +1042,19 @@ export class Agent {
         status: result.isError ? "error" : "success",
       });
       for (const hook of postHooks) {
+        generationInput?.beforeOutput?.();
         ui.toolResult(`hook: ${hook.command}`, !hook.ok);
+        generationInput?.afterOutput?.();
       }
 
       const hookText = [renderHookRuns(preHooks), renderHookRuns(postHooks)].filter(Boolean).join("\n");
       return hookText ? `${result.content}\n\nHook results:\n${hookText}` : result.content;
     } catch (err) {
+      stopQueuedInput();
       const msg = err instanceof Error ? err.message : String(err);
+      generationInput?.beforeOutput?.();
       ui.toolResult(`${tool.name}: ${msg}`, true);
+      generationInput?.afterOutput?.();
       return `Error running ${tool.name}: ${msg}`;
     }
   }

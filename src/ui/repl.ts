@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import readline from "node:readline";
-import type { Agent } from "../agent.js";
+import type { Agent, GenerationInputController } from "../agent.js";
 import type { Config } from "../config.js";
 import { isCommand, runCommand, suggestCommands } from "../commands.js";
 import { ui, chalk } from "./render.js";
@@ -90,6 +90,139 @@ interface RenderGeometry {
 
 const EMPTY_GEOMETRY: RenderGeometry = { rows: 0, cursorRow: 0 };
 
+class QueuedInputController implements GenerationInputController {
+  private line = "";
+  private cursor = 0;
+  private geom: RenderGeometry = { ...EMPTY_GEOMETRY };
+  private active = false;
+  private repaintTimer: ReturnType<typeof setImmediate> | null = null;
+
+  constructor(private readonly queue: string[]) {}
+
+  start(): void {
+    if (this.active || !process.stdout.isTTY) return;
+    this.active = true;
+    this.repaint();
+  }
+
+  stop(): void {
+    if (this.repaintTimer) {
+      clearImmediate(this.repaintTimer);
+      this.repaintTimer = null;
+    }
+    if (this.active) {
+      clearRendered(this.geom);
+      this.geom = { ...EMPTY_GEOMETRY };
+      this.active = false;
+    }
+  }
+
+  takeDraft(): string {
+    const draft = this.line;
+    this.line = "";
+    this.cursor = 0;
+    return draft;
+  }
+
+  beforeOutput(): void {
+    if (!this.active) return;
+    if (this.repaintTimer) {
+      clearImmediate(this.repaintTimer);
+      this.repaintTimer = null;
+    }
+    clearRendered(this.geom);
+    this.geom = { ...EMPTY_GEOMETRY };
+  }
+
+  afterOutput(): void {
+    if (!this.active) return;
+    this.repaint();
+  }
+
+  handleKeypress(str: string, key: readline.Key): void {
+    if (!this.active) return;
+    if (key.name === "return" || key.name === "enter") {
+      const submitted = this.line.trim();
+      if (submitted) {
+        this.queue.push(submitted);
+        this.line = "";
+        this.cursor = 0;
+      }
+      this.repaint();
+      return;
+    }
+    if (key.name === "backspace") {
+      if (this.cursor > 0) {
+        this.line = this.line.slice(0, this.cursor - 1) + this.line.slice(this.cursor);
+        this.cursor--;
+        this.repaint();
+      }
+      return;
+    }
+    if (key.name === "delete") {
+      if (this.cursor < this.line.length) {
+        this.line = this.line.slice(0, this.cursor) + this.line.slice(this.cursor + 1);
+        this.repaint();
+      }
+      return;
+    }
+    if (key.name === "left") {
+      if (this.cursor > 0) {
+        this.cursor--;
+        this.repaint();
+      }
+      return;
+    }
+    if (key.name === "right") {
+      if (this.cursor < this.line.length) {
+        this.cursor++;
+        this.repaint();
+      }
+      return;
+    }
+    if (key.name === "home") {
+      this.cursor = 0;
+      this.repaint();
+      return;
+    }
+    if (key.name === "end") {
+      this.cursor = this.line.length;
+      this.repaint();
+      return;
+    }
+    if (key.ctrl || key.meta) return;
+    if (!str) return;
+
+    const clean = str.replace(/[\x00-\x1f\x7f]/g, "");
+    if (!clean) return;
+    this.line = this.line.slice(0, this.cursor) + clean + this.line.slice(this.cursor);
+    this.cursor += clean.length;
+    this.scheduleRepaint();
+  }
+
+  private scheduleRepaint(): void {
+    if (this.repaintTimer) return;
+    this.repaintTimer = setImmediate(() => {
+      this.repaintTimer = null;
+      this.repaint();
+    });
+  }
+
+  private repaint(): void {
+    if (!this.active) return;
+    const suffix = this.queue.length > 0 ? chalk.dim(`  queued ${this.queue.length}`) : "";
+    this.geom = renderPrompt(
+      {
+        line: this.line + suffix,
+        cursor: this.cursor,
+        promptText: chalk.bold.green("› "),
+        suggestionRows: [chalk.dim("  esc to interrupt")],
+      },
+      this.geom,
+    );
+  }
+}
+
 /** Clear a previously rendered block, accounting for lines that wrapped across columns. */
 function clearRendered(geom: RenderGeometry): void {
   if (geom.rows <= 0) return;
@@ -152,14 +285,14 @@ function fallbackAsk(promptText: string, history: string[]): Promise<string | nu
   });
 }
 
-function readInteractiveLine(promptText: string, history: string[], cwd: string): Promise<string | null> {
+function readInteractiveLine(promptText: string, history: string[], cwd: string, initialLine = ""): Promise<string | null> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return fallbackAsk(promptText, history);
   }
 
   return new Promise((resolve) => {
-    let line = "";
-    let cursor = 0;
+    let line = initialLine;
+    let cursor = initialLine.length;
     let geom: RenderGeometry = { ...EMPTY_GEOMETRY };
     let repaintTimer: ReturnType<typeof setImmediate> | null = null;
     let settled = false;
@@ -328,7 +461,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string)
  * Read multi-line input. A trailing backslash continues onto the next line.
  * The continuation prompt is "... " to visually indicate more input is expected.
  */
-async function readMultiline(history: string[]): Promise<string | null> {
+async function readMultiline(history: string[], initialLine = ""): Promise<string | null> {
   const lines: string[] = [];
   let first = true;
 
@@ -337,7 +470,7 @@ async function readMultiline(history: string[]): Promise<string | null> {
     const promptText = first
       ? chalk.bold.green("› ")
       : chalk.dim("... ");
-    const line = await readInteractiveLine(promptText, first ? history : [], process.cwd());
+    const line = await readInteractiveLine(promptText, first ? history : [], process.cwd(), first ? initialLine : "");
     if (line === null) {
       return first ? null : lines.join("\n");
     }
@@ -409,26 +542,12 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
   agent.sessionStart();
 
   const history: string[] = [];
+  const queuedInputs: string[] = [];
+  const generationInput = new QueuedInputController(queuedInputs);
+  let queuedDraft = "";
 
-  while (true) {
-    let input: string | null;
-    try {
-      input = await readMultiline(history);
-    } catch (err) {
-      if (isAbortError(err)) {
-        console.log();
-        continue;
-      }
-      throw err;
-    }
-
-    if (input === null) {
-      saveSession(process.cwd(), agent.getSession());
-      console.log(chalk.dim("\nGoodbye."));
-      return;
-    }
-
-    if (!input) continue;
+  const handleInput = async (input: string): Promise<boolean> => {
+    if (!input) return true;
 
     // Add to history for arrow-key recall.
     const firstLine = input.split("\n")[0].trim();
@@ -441,7 +560,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
       const command = input.trim().slice(1);
       ui.toolCall(`! ${command}`);
       runShellCommand(command);
-      continue;
+      return true;
     }
 
     // Dragged-in files: a terminal inserts absolute paths as text. Detect them
@@ -450,7 +569,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
     if (dragged.paths.length > 0) {
       ui.info(`📎 attached: ${dragged.paths.map((p) => path.basename(p)).join(", ")}`);
       try {
-        await agent.run(dragged.text, { attachments: dragged.paths });
+        await agent.run(dragged.text, { attachments: dragged.paths, generationInput });
         saveSession(process.cwd(), agent.getSession());
       } catch (err) {
         if (isAbortError(err)) {
@@ -459,7 +578,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
           ui.error(`\nError: ${(err as Error).message}`);
         }
       }
-      continue;
+      return true;
     }
 
     // Quick memory: #note appends to DEEPSEEK.md.
@@ -467,7 +586,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
       const note = input.trim().slice(1).trim();
       if (!note) {
         ui.warn("Usage: #<note to remember>");
-        continue;
+        return true;
       }
       try {
         const file = appendProjectMemory(process.cwd(), note);
@@ -476,32 +595,63 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
       } catch (err) {
         ui.error(`Could not write memory: ${(err as Error).message}`);
       }
-      continue;
+      return true;
     }
 
     if (isCommand(input)) {
       try {
-        const result = await runCommand(input, { agent, config });
+        const result = await runCommand(input, { agent, config, generationInput });
         if (result.exit) {
           saveSession(process.cwd(), agent.getSession());
           console.log(chalk.dim("Goodbye."));
-          return;
+          return false;
         }
       } catch (err) {
         if (!isAbortError(err)) ui.error(`Command error: ${(err as Error).message}`);
       }
-      continue;
+      return true;
     }
 
     try {
-      await agent.run(input);
+      await agent.run(input, { generationInput });
       saveSession(process.cwd(), agent.getSession());
     } catch (err) {
       if (isAbortError(err)) {
         ui.warn("\nInterrupted.");
-        continue;
+        return true;
       }
       ui.error(`\nError: ${(err as Error).message}`);
     }
+
+    return true;
+  };
+
+  while (true) {
+    let input: string | null;
+    if (queuedInputs.length > 0) {
+      input = queuedInputs.shift() ?? "";
+      process.stdout.write("\n" + chalk.bold.green("› ") + input + "\n");
+    } else {
+      queuedDraft = generationInput.takeDraft() || queuedDraft;
+      try {
+        input = await readMultiline(history, queuedDraft);
+        queuedDraft = "";
+      } catch (err) {
+        if (isAbortError(err)) {
+          console.log();
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (input === null) {
+      saveSession(process.cwd(), agent.getSession());
+      console.log(chalk.dim("\nGoodbye."));
+      return;
+    }
+
+    const keepGoing = await handleInput(input);
+    if (!keepGoing) return;
   }
 }
