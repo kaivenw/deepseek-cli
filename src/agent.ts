@@ -412,6 +412,7 @@ export class Agent {
     ];
     this.checkpoints = [];
     this.totalUsage = { ...data.totalUsage };
+    this.sanitizeHistory();
   }
 
   getContextSummary(): string | null {
@@ -616,6 +617,10 @@ export class Agent {
 
     this.messages.push({ role: "user", content });
 
+    // Guard against invalid history (e.g. an older saved session containing an
+    // assistant message with neither content nor tool_calls), which the API rejects.
+    this.sanitizeHistory();
+
     const supportsTools = findModel(this.config.model)?.supportsTools !== false;
     const tools = supportsTools ? toOpenAITools() : [];
 
@@ -755,6 +760,26 @@ export class Agent {
    * reasoning_content to accompany tool_calls during an active tool chain, but it
    * must not be resent on subsequent user turns once the turn has concluded.
    */
+  /**
+   * Ensure every assistant message has content or tool_calls. DeepSeek rejects
+   * assistant messages where both are missing (can happen with sessions saved by
+   * older builds or after edits/compression). Such messages are normalised to "".
+   */
+  private sanitizeHistory(): void {
+    for (const message of this.messages) {
+      const msg = message as { role?: string; content?: unknown; tool_calls?: unknown };
+      if (msg.role !== "assistant") continue;
+      const hasContent =
+        (typeof msg.content === "string" && msg.content.length > 0) ||
+        (Array.isArray(msg.content) && msg.content.length > 0);
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      if (!hasContent && !hasToolCalls) {
+        msg.content = "";
+        if (msg.tool_calls !== undefined) delete msg.tool_calls;
+      }
+    }
+  }
+
   private stripReasoningContent(): void {
     for (const message of this.messages) {
       const withReasoning = message as { reasoning_content?: string };
