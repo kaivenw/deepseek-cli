@@ -235,8 +235,7 @@ class QueuedInputController implements GenerationInputController {
   private repaint(): void {
     if (!this.active) return;
     const dots = ".".repeat((this.frame % 3) + 1);
-    const queued = this.queue.length > 0 ? chalk.dim(`  queued ${this.queue.length}`) : "";
-    const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}${queued}`;
+    const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}`;
     const tipLine = "  " + chalk.dim("enter queues next message · esc interrupts");
     const divider = chalk.dim("─".repeat(Math.min(process.stdout.columns || 60, 60)));
     this.geom = renderPrompt(
