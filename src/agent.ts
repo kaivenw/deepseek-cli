@@ -677,22 +677,18 @@ export class Agent {
       // Reasoning is always captured for the API contract (see client.stream);
       // these callbacks only control how/whether it is displayed.
       const printReasoning = (delta: string) => {
-        options.generationInput?.beforeOutput?.();
         if (!reasoningStarted) {
+          options.generationInput?.stop();
           spinner.stop();
           process.stdout.write(chalk.dim.italic("\n  [thinking] "));
           reasoningStarted = true;
         }
         if (thinkingMode === "full") {
           process.stdout.write(chalk.dim.italic(delta.replace(/\n/g, "\n  ")));
-          options.generationInput?.afterOutput?.();
           return;
         }
         // collapsed: show only the first few lines, then stop printing the rest.
-        if (reasoningCut) {
-          options.generationInput?.afterOutput?.();
-          return;
-        }
+        if (reasoningCut) return;
         const segments = delta.split("\n");
         for (let i = 0; i < segments.length; i++) {
           if (i > 0) {
@@ -700,14 +696,12 @@ export class Agent {
             if (reasoningLines > COLLAPSED_REASONING_LINES) {
               process.stdout.write(chalk.dim.italic(" …"));
               reasoningCut = true;
-              options.generationInput?.afterOutput?.();
               return;
             }
             process.stdout.write("\n  ");
           }
           if (segments[i]) process.stdout.write(chalk.dim.italic(segments[i]));
         }
-        options.generationInput?.afterOutput?.();
       };
 
       const abortController = new AbortController();
@@ -718,15 +712,13 @@ export class Agent {
           onReasoning: thinkingMode === "off" ? undefined : printReasoning,
           onText: (delta) => {
             if (!textStarted) {
-              options.generationInput?.beforeOutput?.();
+              options.generationInput?.stop();
               spinner.stop();
               if (reasoningStarted) process.stdout.write("\n");
               ui.assistantLabel();
               textStarted = true;
             }
-            options.generationInput?.beforeOutput?.();
             process.stdout.write(delta);
-            options.generationInput?.afterOutput?.();
           },
         }, { signal: abortController.signal });
       } catch (err) {
