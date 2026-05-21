@@ -81,26 +81,50 @@ function commandSuggestionRows(suggestions: CommandSuggestion[], selectedIndex: 
   });
 }
 
-function clearRenderedBlock(renderedRows: number): void {
-  if (renderedRows <= 0) return;
+interface RenderGeometry {
+  /** Total physical terminal rows the rendered block occupies. */
+  rows: number;
+  /** Physical row (0-based from the top of the block) where the input cursor sits. */
+  cursorRow: number;
+}
+
+const EMPTY_GEOMETRY: RenderGeometry = { rows: 0, cursorRow: 0 };
+
+/** Clear a previously rendered block, accounting for lines that wrapped across columns. */
+function clearRendered(geom: RenderGeometry): void {
+  if (geom.rows <= 0) return;
+  // The cursor sits on geom.cursorRow; move up to the top of the block first.
+  if (geom.cursorRow > 0) readline.moveCursor(process.stdout, 0, -geom.cursorRow);
   readline.cursorTo(process.stdout, 0);
   readline.clearScreenDown(process.stdout);
 }
 
-function renderPrompt(state: PromptRenderState, previousRows: number): number {
-  clearRenderedBlock(previousRows);
+function renderPrompt(state: PromptRenderState, previous: RenderGeometry): RenderGeometry {
+  clearRendered(previous);
 
+  const cols = Math.max(1, process.stdout.columns || 80);
   process.stdout.write(state.promptText + state.line);
   for (const row of state.suggestionRows) {
     process.stdout.write("\n" + row);
   }
 
-  const renderedRows = 1 + state.suggestionRows.length;
-  if (state.suggestionRows.length > 0) {
-    readline.moveCursor(process.stdout, 0, -state.suggestionRows.length);
-  }
-  readline.cursorTo(process.stdout, lastLineWidth(state.promptText) + displayWidth(state.line.slice(0, state.cursor)));
-  return renderedRows;
+  // Account for the prompt+line wrapping across terminal columns.
+  const promptWidth = lastLineWidth(state.promptText);
+  const contentWidth = promptWidth + displayWidth(state.line);
+  const contentRows = Math.max(1, Math.ceil(contentWidth / cols));
+  const totalRows = contentRows + state.suggestionRows.length;
+
+  const cursorOffset = promptWidth + displayWidth(state.line.slice(0, state.cursor));
+  const cursorRow = Math.min(contentRows - 1, Math.floor(cursorOffset / cols));
+  const cursorCol = cursorOffset % cols;
+
+  // After the writes the terminal cursor is on the last drawn row; bring it back
+  // up to the input cursor's physical row, then to the right column.
+  const up = totalRows - 1 - cursorRow;
+  if (up > 0) readline.moveCursor(process.stdout, 0, -up);
+  readline.cursorTo(process.stdout, cursorCol);
+
+  return { rows: totalRows, cursorRow };
 }
 
 function fallbackAsk(promptText: string, history: string[]): Promise<string | null> {
@@ -136,7 +160,8 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string)
   return new Promise((resolve) => {
     let line = "";
     let cursor = 0;
-    let renderedRows = 0;
+    let geom: RenderGeometry = { ...EMPTY_GEOMETRY };
+    let repaintTimer: ReturnType<typeof setImmediate> | null = null;
     let settled = false;
     let historyIndex = history.length;
     let draftLine = "";
@@ -146,9 +171,10 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string)
     const finish = (value: string | null) => {
       if (settled) return;
       settled = true;
+      if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
       process.stdin.off("keypress", onKeypress);
       if (!wasRaw) process.stdin.setRawMode(false);
-      clearRenderedBlock(renderedRows);
+      clearRendered(geom);
       process.stdout.write(promptText + (value ?? line) + "\n");
       resolve(value);
     };
@@ -164,17 +190,28 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string)
     };
 
     const repaint = () => {
+      if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
       const suggestions = currentSuggestions();
       if (selectedSuggestion >= suggestions.length) selectedSuggestion = Math.max(0, suggestions.length - 1);
-      renderedRows = renderPrompt(
+      geom = renderPrompt(
         {
           line,
           cursor,
           promptText,
           suggestionRows: commandSuggestionRows(suggestions, selectedSuggestion),
         },
-        renderedRows,
+        geom,
       );
+    };
+
+    // Coalesce a burst of inserts (paste / drag delivers many keypresses in one
+    // synchronous tick) into a single repaint, so wrapped lines don't stack up.
+    const scheduleRepaint = () => {
+      if (repaintTimer) return;
+      repaintTimer = setImmediate(() => {
+        repaintTimer = null;
+        repaint();
+      });
     };
 
     const setLine = (next: string) => {
@@ -266,12 +303,16 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string)
         return;
       }
       if (key.ctrl || key.meta) return;
-      if (str && str >= " " && str !== "\x7f") {
-        line = line.slice(0, cursor) + str + line.slice(cursor);
-        cursor += str.length;
-        historyIndex = history.length;
-        selectedSuggestion = 0;
-        repaint();
+      if (str) {
+        // Strip control chars (newlines/tabs etc. from a paste or drag) before inserting.
+        const clean = str.replace(/[\x00-\x1f\x7f]/g, "");
+        if (clean) {
+          line = line.slice(0, cursor) + clean + line.slice(cursor);
+          cursor += clean.length;
+          historyIndex = history.length;
+          selectedSuggestion = 0;
+          scheduleRepaint();
+        }
       }
     };
 
