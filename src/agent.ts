@@ -49,6 +49,7 @@ export interface GenerationInputController {
   handleKeypress(str: string, key: KeypressKey): void;
   beforeOutput?(): void;
   afterOutput?(): void;
+  setStatus?(status: string): void;
 }
 
 type UserContent = string | OpenAI.Chat.Completions.ChatCompletionContentPart[];
@@ -670,6 +671,7 @@ export class Agent {
       let reasoningLines = 1;
       let reasoningCut = false;
       const spinner = new Spinner("thinking…");
+      options.generationInput?.setStatus?.(iter === 0 ? "Thinking" : "Continuing");
       if (!options.generationInput) spinner.start();
 
       // Reasoning is always captured for the API contract (see client.stream);
@@ -998,6 +1000,7 @@ export class Agent {
     }
 
     const preview = tool.preview ? tool.preview(args, this.ctx) : tool.name;
+    generationInput?.setStatus?.(`Running ${tool.name}`);
     generationInput?.beforeOutput?.();
     ui.toolCall(preview);
     generationInput?.afterOutput?.();

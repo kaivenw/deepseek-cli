@@ -58,6 +58,14 @@ function lastLineWidth(text: string): number {
   return displayWidth(plain.slice(plain.lastIndexOf("\n") + 1));
 }
 
+function physicalRows(text: string, cols: number): number {
+  const plain = stripAnsi(text);
+  if (!plain) return 0;
+  return plain
+    .split("\n")
+    .reduce((rows, line) => rows + Math.max(1, Math.ceil(displayWidth(line) / cols)), 0);
+}
+
 function commandSuggestions(line: string, cwd: string): CommandSuggestion[] {
   const trimmedStart = line.trimStart();
   if (!trimmedStart.startsWith("/")) return [];
@@ -96,16 +104,27 @@ class QueuedInputController implements GenerationInputController {
   private geom: RenderGeometry = { ...EMPTY_GEOMETRY };
   private active = false;
   private repaintTimer: ReturnType<typeof setImmediate> | null = null;
+  private animationTimer: NodeJS.Timeout | null = null;
+  private frame = 0;
+  private status = "Working";
 
   constructor(private readonly queue: string[]) {}
 
   start(): void {
     if (this.active || !process.stdout.isTTY) return;
     this.active = true;
+    this.animationTimer = setInterval(() => {
+      this.frame++;
+      this.repaint();
+    }, 250);
     this.repaint();
   }
 
   stop(): void {
+    if (this.animationTimer) {
+      clearInterval(this.animationTimer);
+      this.animationTimer = null;
+    }
     if (this.repaintTimer) {
       clearImmediate(this.repaintTimer);
       this.repaintTimer = null;
@@ -136,6 +155,11 @@ class QueuedInputController implements GenerationInputController {
 
   afterOutput(): void {
     if (!this.active) return;
+    this.repaint();
+  }
+
+  setStatus(status: string): void {
+    this.status = status;
     this.repaint();
   }
 
@@ -210,13 +234,17 @@ class QueuedInputController implements GenerationInputController {
 
   private repaint(): void {
     if (!this.active) return;
-    const suffix = this.queue.length > 0 ? chalk.dim(`  queued ${this.queue.length}`) : "";
+    const dots = ".".repeat((this.frame % 3) + 1);
+    const queued = this.queue.length > 0 ? chalk.dim(`  queued ${this.queue.length}`) : "";
+    const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}${queued}`;
+    const tipLine = "  " + chalk.dim("enter queues next message · esc interrupts");
+    const divider = chalk.dim("─".repeat(Math.min(process.stdout.columns || 60, 60)));
     this.geom = renderPrompt(
       {
-        line: this.line + suffix,
+        line: this.line,
         cursor: this.cursor,
-        promptText: chalk.bold.green("› "),
-        suggestionRows: [chalk.dim("  esc to interrupt")],
+        promptText: `${loadingLine}\n${tipLine}\n${divider}\n${chalk.bold.green("› ")}`,
+        suggestionRows: [],
       },
       this.geom,
     );
@@ -242,13 +270,15 @@ function renderPrompt(state: PromptRenderState, previous: RenderGeometry): Rende
   }
 
   // Account for the prompt+line wrapping across terminal columns.
+  const promptPrefix = state.promptText.slice(0, Math.max(0, state.promptText.lastIndexOf("\n") + 1));
+  const prefixRows = physicalRows(promptPrefix.endsWith("\n") ? promptPrefix.slice(0, -1) : promptPrefix, cols);
   const promptWidth = lastLineWidth(state.promptText);
   const contentWidth = promptWidth + displayWidth(state.line);
   const contentRows = Math.max(1, Math.ceil(contentWidth / cols));
-  const totalRows = contentRows + state.suggestionRows.length;
+  const totalRows = prefixRows + contentRows + state.suggestionRows.length;
 
   const cursorOffset = promptWidth + displayWidth(state.line.slice(0, state.cursor));
-  const cursorRow = Math.min(contentRows - 1, Math.floor(cursorOffset / cols));
+  const cursorRow = prefixRows + Math.min(contentRows - 1, Math.floor(cursorOffset / cols));
   const cursorCol = cursorOffset % cols;
 
   // After the writes the terminal cursor is on the last drawn row; bring it back
