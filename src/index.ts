@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { confirm, password } from "@inquirer/prompts";
+import { confirm, password, select } from "@inquirer/prompts";
 import { loadConfig, saveConfig, findModel, normalizeThinkingMode, type Config } from "./config.js";
 import { Agent } from "./agent.js";
 import { createPermissionManager } from "./permissions.js";
@@ -22,6 +22,42 @@ interface CliOptions {
   /** Commander stores --continue under this property name. */
   continue?: boolean;
   resume?: boolean;
+}
+
+type WorkspaceDecision = "confirmed" | "declined" | "unavailable";
+
+async function confirmWorkspace(cwd: string, autoApprove: boolean): Promise<WorkspaceDecision> {
+  if (autoApprove) return "confirmed";
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    ui.error("Workspace confirmation required.");
+    ui.info(`Current directory: ${cwd}`);
+    ui.info("Run interactively to confirm this workspace, or use --yes for non-interactive runs.");
+    return "unavailable";
+  }
+
+  const width = Math.min(process.stdout.columns || 80, 100);
+  console.log();
+  console.log(chalk.yellow("─".repeat(width)));
+  console.log(chalk.yellow.bold("Accessing workspace:"));
+  console.log();
+  console.log(chalk.bold(cwd));
+  console.log();
+  console.log(
+    "Quick safety check: Is this a project you created or one you trust? " +
+      "DeepSeek CLI will be able to read, edit, and execute files here.",
+  );
+  console.log();
+
+  const decision = await select<"yes" | "no">({
+    message: "Continue in this directory?",
+    choices: [
+      { name: "Yes, use this workspace", value: "yes" },
+      { name: "No, exit", value: "no" },
+    ],
+  });
+
+  return decision === "yes" ? "confirmed" : "declined";
 }
 
 function readStdin(): Promise<string> {
@@ -70,12 +106,12 @@ async function main(): Promise<void> {
   program
     .name("deepseek")
     .description("An agentic coding CLI for DeepSeek models")
-    .version("0.1.0")
+    .version("0.1.7")
     .argument("[prompt...]", "run a one-shot prompt instead of the interactive REPL")
     .option("-m, --model <model>", "model to use (e.g. deepseek-v4-pro, deepseek-v4-flash)")
     .option("-p, --print", "print mode: run the prompt once and exit")
     .option("--api-key <key>", "DeepSeek API key (overrides config/env)")
-    .option("-y, --yes", "auto-approve all tool actions (use with care)")
+    .option("-y, --yes", "auto-approve workspace and tool actions (use with care)")
     .option("--thinking <mode>", "reasoning display: off | collapsed | full (overrides config)")
     .option("--show-thinking", "alias for --thinking full")
     .option("--hide-thinking", "alias for --thinking off")
@@ -103,6 +139,12 @@ async function main(): Promise<void> {
     normalizeThinkingMode(opts.thinking) ??
     (opts.hideThinking ? "off" : opts.showThinking ? "full" : undefined);
   if (thinkingOverride) config.thinkingMode = thinkingOverride;
+
+  const workspaceDecision = await confirmWorkspace(process.cwd(), Boolean(opts.yes));
+  if (workspaceDecision !== "confirmed") {
+    if (workspaceDecision === "declined") console.log(chalk.dim("\nGoodbye."));
+    process.exit(workspaceDecision === "declined" ? 0 : 1);
+  }
 
   if (!(await ensureApiKey(config))) {
     process.exit(1);

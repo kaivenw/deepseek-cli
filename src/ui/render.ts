@@ -8,7 +8,7 @@ interface BannerOptions {
   mcpErrors?: number;
 }
 
-const CLI_VERSION = "0.1.0";
+const CLI_VERSION = "0.1.7";
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
