@@ -6,6 +6,7 @@ import { maskKey, type Config } from "../config.js";
 import { isCommand, runCommand, suggestCommands } from "../commands.js";
 import { ui, chalk } from "./render.js";
 import { loadSession, saveSession } from "../session.js";
+import { loadHistory, saveHistory } from "../history.js";
 import { appendProjectMemory } from "../project.js";
 import { extractDraggedPaths } from "../attachments.js";
 import path from "node:path";
@@ -304,6 +305,7 @@ export class QueuedInputController implements GenerationInputController {
 
   handleKeypress(str: string, key: readline.Key): void {
     if (!this.active) return;
+    if (key.name === "paste-start" || key.name === "paste-end") return; // ignore paste markers
     if (key.name === "return" || key.name === "enter") {
       const submitted = this.line.trim();
       if (submitted) {
@@ -409,6 +411,41 @@ function clearRendered(geom: RenderGeometry): void {
   readline.clearScreenDown(process.stdout);
 }
 
+/**
+ * Lay out the input content (which may contain "\n" from Shift+Enter or a
+ * multi-line paste). Each logical line wraps independently across `cols`; the
+ * first one starts after the prompt. Returns total physical rows and the
+ * cursor's physical row/column within the content block.
+ */
+export function computeLayout(
+  promptWidth: number,
+  line: string,
+  cols: number,
+  cursor: number,
+): { contentRows: number; cursorRow: number; cursorCol: number } {
+  const segments = line.split("\n");
+  let contentRows = 0;
+  let cursorRow = 0;
+  let cursorCol = promptWidth % cols;
+  let idx = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const startCol = i === 0 ? promptWidth : 0;
+    const total = startCol + displayWidth(seg);
+    const segRows = Math.max(1, Math.ceil((total === 0 ? 1 : total) / cols));
+    const segStart = idx;
+    const segEnd = idx + seg.length;
+    if (cursor >= segStart && cursor <= segEnd) {
+      const colOffset = startCol + displayWidth(seg.slice(0, cursor - segStart));
+      cursorRow = contentRows + Math.min(segRows - 1, Math.floor(colOffset / cols));
+      cursorCol = colOffset % cols;
+    }
+    contentRows += segRows;
+    idx = segEnd + 1; // consume the "\n" separator
+  }
+  return { contentRows, cursorRow, cursorCol };
+}
+
 function renderPrompt(state: PromptRenderState, previous: RenderGeometry): RenderGeometry {
   clearRendered(previous);
 
@@ -418,17 +455,19 @@ function renderPrompt(state: PromptRenderState, previous: RenderGeometry): Rende
     process.stdout.write("\n" + row);
   }
 
-  // Account for the prompt+line wrapping across terminal columns.
+  // Account for the prompt+line wrapping across terminal columns and any
+  // embedded newlines in the input.
   const promptPrefix = state.promptText.slice(0, Math.max(0, state.promptText.lastIndexOf("\n") + 1));
   const prefixRows = physicalRows(promptPrefix.endsWith("\n") ? promptPrefix.slice(0, -1) : promptPrefix, cols);
   const promptWidth = lastLineWidth(state.promptText);
-  const contentWidth = promptWidth + displayWidth(state.line);
-  const contentRows = Math.max(1, Math.ceil(contentWidth / cols));
+  const { contentRows, cursorRow: contentCursorRow, cursorCol } = computeLayout(
+    promptWidth,
+    state.line,
+    cols,
+    state.cursor,
+  );
   const totalRows = prefixRows + contentRows + state.suggestionRows.length;
-
-  const cursorOffset = promptWidth + displayWidth(state.line.slice(0, state.cursor));
-  const cursorRow = prefixRows + Math.min(contentRows - 1, Math.floor(cursorOffset / cols));
-  const cursorCol = cursorOffset % cols;
+  const cursorRow = prefixRows + contentCursorRow;
 
   // After the writes the terminal cursor is on the last drawn row; bring it back
   // up to the input cursor's physical row, then to the right column.
@@ -464,7 +503,7 @@ function fallbackAsk(promptText: string, history: string[]): Promise<string | nu
   });
 }
 
-function readInteractiveLine(promptText: string, history: string[], cwd: string, initialLine = "", modeProvider?: ModeController): Promise<string | null> {
+export function readInteractiveLine(promptText: string, history: string[], cwd: string, initialLine = "", modeProvider?: ModeController): Promise<string | null> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return fallbackAsk(promptText, history);
   }
@@ -482,6 +521,13 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
     let escArmed = false;
     let hint = "";
     let armTimer: ReturnType<typeof setTimeout> | null = null;
+    let pasting = false;
+    // Reverse history search (Ctrl+R) state.
+    let searchMode = false;
+    let searchQuery = "";
+    let matchIdx = -1;
+    let savedLine = "";
+    let savedCursor = 0;
     const wasRaw = process.stdin.isRaw;
 
     const disarm = () => {
@@ -505,6 +551,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
       if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
       if (armTimer) { clearTimeout(armTimer); armTimer = null; }
       process.stdin.off("keypress", onKeypress);
+      if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); // disable bracketed paste
       if (!wasRaw) process.stdin.setRawMode(false);
       clearRendered(geom);
       process.stdout.write(promptText + (value ?? line) + "\n");
@@ -522,12 +569,26 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
 
     const repaint = () => {
       if (repaintTimer) { clearImmediate(repaintTimer); repaintTimer = null; }
-      const { items } = completions();
-      if (selectedSuggestion >= items.length) selectedSuggestion = Math.max(0, items.length - 1);
-      const rows = completionRows(items, selectedSuggestion);
-      const modeLabel = modeProvider?.label() ?? "";
-      if (modeLabel) rows.push(chalk.yellow("  ⏵⏵ " + modeLabel) + chalk.dim("  ·  shift+tab to cycle"));
-      if (hint) rows.push(chalk.dim("  " + hint));
+      let rows: string[] = [];
+      if (searchMode) {
+        const tag = matchIdx >= 0 ? "" : chalk.red("  (no match)");
+        const q = searchQuery ? searchQuery : chalk.dim("type to search");
+        rows.push(
+          chalk.cyan("  ⌕ ") + chalk.dim("reverse-search: ") + q + tag +
+            chalk.dim("   ^R older · ↵ accept · Esc cancel"),
+        );
+      } else {
+        const { items } = completions();
+        if (selectedSuggestion >= items.length) selectedSuggestion = Math.max(0, items.length - 1);
+        rows = completionRows(items, selectedSuggestion);
+        const modeLabel = modeProvider?.label() ?? "";
+        if (modeLabel) rows.push(chalk.yellow("  ⏵⏵ " + modeLabel) + chalk.dim("  ·  shift+tab to cycle"));
+        if (hint) rows.push(chalk.dim("  " + hint));
+        // Idle hint bar: only when the line is empty and nothing else is showing.
+        if (!hint && items.length === 0 && line.length === 0) {
+          rows.push(chalk.dim("  ↵ send · ⌥↵ newline · / commands · @ files · ^R history · ^C exit"));
+        }
+      }
       geom = renderPrompt(
         {
           line,
@@ -556,7 +617,117 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
       repaint();
     };
 
+    // --- word boundaries (for Ctrl/Alt word movement & deletion) ---
+    const isWordChar = (c: string | undefined): boolean => !!c && !/\s/.test(c);
+    const prevWord = (pos: number): number => {
+      let i = pos;
+      while (i > 0 && !isWordChar(line[i - 1])) i--;
+      while (i > 0 && isWordChar(line[i - 1])) i--;
+      return i;
+    };
+    const nextWord = (pos: number): number => {
+      let i = pos;
+      while (i < line.length && !isWordChar(line[i])) i++;
+      while (i < line.length && isWordChar(line[i])) i++;
+      return i;
+    };
+
+    // --- vertical cursor movement across logical lines (multi-line input) ---
+    const moveVertical = (dir: -1 | 1): boolean => {
+      if (!line.includes("\n")) return false;
+      const lineStart = line.lastIndexOf("\n", cursor - 1) + 1;
+      const col = cursor - lineStart;
+      if (dir === -1) {
+        if (lineStart === 0) return false; // already on the first line
+        const prevStart = line.lastIndexOf("\n", lineStart - 2) + 1;
+        const prevLen = lineStart - 1 - prevStart;
+        cursor = prevStart + Math.min(col, prevLen);
+      } else {
+        const lineEnd = line.indexOf("\n", cursor);
+        if (lineEnd === -1) return false; // already on the last line
+        const nextStart = lineEnd + 1;
+        let nextEnd = line.indexOf("\n", nextStart);
+        if (nextEnd === -1) nextEnd = line.length;
+        cursor = nextStart + Math.min(col, nextEnd - nextStart);
+      }
+      repaint();
+      return true;
+    };
+
+    // --- reverse history search (Ctrl+R) ---
+    const findMatch = (from: number): number => {
+      const q = searchQuery.toLowerCase();
+      for (let i = from; i >= 0; i--) {
+        const entry = history[i];
+        if (entry != null && entry.toLowerCase().includes(q)) return i;
+      }
+      return -1;
+    };
+    const enterSearch = (): void => {
+      searchMode = true;
+      searchQuery = "";
+      savedLine = line;
+      savedCursor = cursor;
+      matchIdx = history.length - 1;
+      repaint();
+    };
+    const refreshSearch = (): void => {
+      matchIdx = findMatch(history.length - 1);
+      if (matchIdx >= 0) { line = history[matchIdx]; cursor = line.length; }
+      repaint();
+    };
+    const olderMatch = (): void => {
+      if (matchIdx > 0) {
+        const idx = findMatch(matchIdx - 1);
+        if (idx >= 0) { matchIdx = idx; line = history[idx]; cursor = line.length; }
+      }
+      repaint();
+    };
+    const exitSearch = (keep: boolean): void => {
+      searchMode = false;
+      searchQuery = "";
+      if (keep) historyIndex = history.length;
+      else { line = savedLine; cursor = savedCursor; }
+      selectedSuggestion = 0;
+      repaint();
+    };
+
     const onKeypress = (str: string, key: readline.Key) => {
+      // Bracketed paste: insert literal text (incl. newlines) without firing keys.
+      if (key.name === "paste-start") { pasting = true; return; }
+      if (key.name === "paste-end") {
+        pasting = false;
+        historyIndex = history.length;
+        selectedSuggestion = 0;
+        scheduleRepaint();
+        return;
+      }
+      if (pasting) {
+        // Keep newlines (\n = 0x0a); drop CR and other control chars.
+        const chunk = (str ?? "").replace(/\r/g, "").replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "");
+        if (chunk) {
+          line = line.slice(0, cursor) + chunk + line.slice(cursor);
+          cursor += chunk.length;
+          scheduleRepaint();
+        }
+        return;
+      }
+
+      // Reverse-search sub-mode swallows most keys while active.
+      if (searchMode) {
+        if (key.ctrl && key.name === "r") { olderMatch(); return; }
+        if ((key.ctrl && (key.name === "c" || key.name === "g")) || key.name === "escape") { exitSearch(false); return; }
+        if (key.name === "return" || key.name === "enter") { exitSearch(true); return; }
+        if (key.name === "backspace") { searchQuery = searchQuery.slice(0, -1); refreshSearch(); return; }
+        if (["left", "right", "home", "end"].includes(key.name ?? "")) { exitSearch(true); return; }
+        if (key.ctrl || key.meta) return;
+        if (str) {
+          const clean = str.replace(/[\x00-\x1f\x7f]/g, "");
+          if (clean) { searchQuery += clean; refreshSearch(); }
+        }
+        return;
+      }
+
       // Ctrl+C: clear a non-empty line; on an empty line, require a second press to exit.
       if (key.ctrl && key.name === "c") {
         if (line.length > 0) {
@@ -593,6 +764,19 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
       }
       // Any other key cancels a pending Ctrl+C / Esc arming.
       if (ctrlCArmed || escArmed) disarm();
+      // Ctrl+R: open reverse history search.
+      if (key.ctrl && key.name === "r") {
+        if (history.length > 0) enterSearch();
+        return;
+      }
+      // Option/Alt/Shift + Enter: insert a newline instead of submitting.
+      if ((key.name === "return" || key.name === "enter") && (key.meta || key.shift)) {
+        line = line.slice(0, cursor) + "\n" + line.slice(cursor);
+        cursor++;
+        selectedSuggestion = 0;
+        repaint();
+        return;
+      }
       if (key.name === "return" || key.name === "enter") {
         const { kind, items } = completions();
         const item = items[selectedSuggestion];
@@ -603,6 +787,25 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
           return;
         }
         finish(line);
+        return;
+      }
+      // Delete previous word: Ctrl+W or Alt/Meta+Backspace.
+      if ((key.ctrl && key.name === "w") || (key.meta && key.name === "backspace")) {
+        const start = prevWord(cursor);
+        if (start < cursor) {
+          line = line.slice(0, start) + line.slice(cursor);
+          cursor = start;
+          repaint();
+        }
+        return;
+      }
+      // Delete next word: Alt/Meta+Delete or Alt/Meta+d.
+      if (key.meta && (key.name === "delete" || key.name === "d")) {
+        const end = nextWord(cursor);
+        if (end > cursor) {
+          line = line.slice(0, cursor) + line.slice(end);
+          repaint();
+        }
         return;
       }
       if (key.name === "backspace") {
@@ -620,6 +823,11 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
         }
         return;
       }
+      // Word-wise movement: Ctrl/Alt + arrows, Alt+b / Alt+f.
+      if ((key.ctrl || key.meta) && key.name === "left") { cursor = prevWord(cursor); repaint(); return; }
+      if ((key.ctrl || key.meta) && key.name === "right") { cursor = nextWord(cursor); repaint(); return; }
+      if (key.meta && key.name === "b") { cursor = prevWord(cursor); repaint(); return; }
+      if (key.meta && key.name === "f") { cursor = nextWord(cursor); repaint(); return; }
       if (key.name === "left") {
         if (cursor > 0) {
           cursor--;
@@ -651,6 +859,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
           repaint();
           return;
         }
+        if (moveVertical(-1)) return; // multi-line: move cursor up a line first
         if (history.length === 0) return;
         if (historyIndex === history.length) draftLine = line;
         historyIndex = Math.max(0, historyIndex - 1);
@@ -664,6 +873,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
           repaint();
           return;
         }
+        if (moveVertical(1)) return; // multi-line: move cursor down a line first
         if (history.length === 0) return;
         historyIndex = Math.min(history.length, historyIndex + 1);
         setLine(historyIndex === history.length ? draftLine : history[historyIndex] ?? "");
@@ -679,6 +889,28 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
       if (key.name === "tab") {
         const items = completions().items;
         if (items[selectedSuggestion]) applyCompletion(items[selectedSuggestion]);
+        return;
+      }
+      // Emacs-style line editing.
+      if (key.ctrl && key.name === "a") { cursor = 0; repaint(); return; }
+      if (key.ctrl && key.name === "e") { cursor = line.length; repaint(); return; }
+      if (key.ctrl && key.name === "u") {
+        if (cursor > 0) { line = line.slice(cursor); cursor = 0; repaint(); }
+        return;
+      }
+      if (key.ctrl && key.name === "k") {
+        if (cursor < line.length) { line = line.slice(0, cursor); repaint(); }
+        return;
+      }
+      if (key.ctrl && key.name === "d") {
+        if (line.length === 0) { finish(null); return; } // EOF on empty line
+        if (cursor < line.length) { line = line.slice(0, cursor) + line.slice(cursor + 1); repaint(); }
+        return;
+      }
+      if (key.ctrl && key.name === "l") {
+        process.stdout.write("\x1b[2J\x1b[3J\x1b[H"); // clear screen + scrollback
+        geom = { ...EMPTY_GEOMETRY };
+        repaint();
         return;
       }
       if (key.ctrl || key.meta) return;
@@ -697,6 +929,7 @@ function readInteractiveLine(promptText: string, history: string[], cwd: string,
 
     readline.emitKeypressEvents(process.stdin);
     process.stdin.setRawMode(true);
+    if (process.stdout.isTTY) process.stdout.write("\x1b[?2004h"); // enable bracketed paste
     process.stdin.on("keypress", onKeypress);
     process.stdin.resume();
     repaint();
@@ -789,7 +1022,7 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
 
   agent.sessionStart();
 
-  const history: string[] = [];
+  const history: string[] = loadHistory(process.cwd());
   const queuedInputs: string[] = [];
   const generationInput = new QueuedInputController(queuedInputs);
   let queuedDraft = "";
@@ -802,10 +1035,11 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
   const handleInput = async (input: string): Promise<boolean> => {
     if (!input) return true;
 
-    // Add to history for arrow-key recall.
-    const firstLine = input.split("\n")[0].trim();
-    if (firstLine && !history.includes(firstLine)) {
-      history.push(firstLine);
+    // Add to history for arrow-key recall (full input, so multi-line drafts round-trip).
+    const entry = input.trim();
+    if (entry && history[history.length - 1] !== entry) {
+      history.push(entry);
+      saveHistory(process.cwd(), history);
     }
 
     // Shell escape: !command runs directly.
