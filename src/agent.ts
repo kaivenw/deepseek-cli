@@ -356,6 +356,18 @@ export class Agent {
     this.config.model = model;
   }
 
+  /**
+   * Swap the API key (and optionally the endpoint) used for subsequent
+   * requests, rebuilding the underlying client. The conversation/session is
+   * preserved — only the credential changes.
+   */
+  setApiKey(key: string, baseURL?: string): void {
+    this.config.apiKey = key;
+    this.config.apiKeyFromEnv = false;
+    if (baseURL) this.config.baseURL = baseURL;
+    this.client = new DeepSeekClient(this.config);
+  }
+
   getModel(): string {
     return this.config.model;
   }

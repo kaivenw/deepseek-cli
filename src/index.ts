@@ -87,12 +87,16 @@ async function ensureApiKey(config: Config): Promise<boolean> {
     return false;
   }
   config.apiKey = key.trim();
+  config.apiKeyFromEnv = false;
 
   const save = await confirm({
     message: "Save this key to ~/.deepseek-cli/config.json?",
     default: true,
   });
   if (save) {
+    // Register as the "default" profile so it's manageable via /key.
+    config.apiKeys = { ...(config.apiKeys ?? {}), default: { key: config.apiKey } };
+    config.activeApiKey = "default";
     saveConfig(config);
     ui.success("Saved.");
   }
@@ -115,7 +119,7 @@ async function main(): Promise<void> {
   program
     .name("deepseek")
     .description("An agentic coding CLI for DeepSeek models")
-    .version("0.1.8")
+    .version("0.1.9")
     .argument("[prompt...]", "run a one-shot prompt instead of the interactive REPL")
     .option("-m, --model <model>", "model to use (e.g. deepseek-v4-pro, deepseek-v4-flash)")
     .option("-p, --print", "print mode: run the prompt once and exit")

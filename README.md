@@ -189,6 +189,7 @@ CLI 在**每个用户回合开始前自动创建检查点**，快照当时的对
 | `/init` | 勘探项目并创建/更新 `DEEPSEEK.md` 指令文件 |
 | `/model` | 方向键选择模型（从 API 获取或本地回退） |
 | `/models` | 列出可用的 DeepSeek 模型 |
+| `/key [add\|use\|rm\|list]` | 切换 / 添加 / 删除 API Key（带有效性校验，切换保留会话） |
 | `/thinking [on\|off\|collapsed\|full]` | 控制推理过程显示（裸命令切换 on/off） |
 | `/config` | 显示当前配置 |
 | `/mcp <list\|init\|reload>` | 管理 MCP 服务器 |
@@ -356,11 +357,17 @@ deepseek
   "baseURL": "https://api.deepseek.com",
   "model": "deepseek-v4-pro",
   "alwaysAllow": [],
-  "thinkingMode": "collapsed"
+  "thinkingMode": "collapsed",
+  "apiKeys": {
+    "default": { "key": "sk-xxxx" },
+    "团队":    { "key": "sk-yyyy", "baseURL": "https://代理地址" }
+  },
+  "activeApiKey": "default"
 }
 ```
 
 - `apiKey`：可写入文件，但**从环境变量读取的密钥不会被持久化到磁盘**。
+- `apiKeys` / `activeApiKey`：命名 Key 档案与当前选中项,通常用 `/key` 管理而无需手改；旧的单 `apiKey` 会自动迁移为 `default` 档案。
 - `thinkingMode`：`off`（隐藏推理）/ `collapsed`（折叠显示前几行）/ `full`（完整显示）。
 - `alwaysAllow`：始终免审批的工具名称列表。
 

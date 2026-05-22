@@ -45,6 +45,13 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   "deepseek-reasoner": DEFAULT_MODEL,
 };
 
+/** A named API-key profile the user can switch between. */
+export interface ApiKeyProfile {
+  key: string;
+  /** Optional per-profile endpoint; falls back to the global baseURL. */
+  baseURL?: string;
+}
+
 export interface Config {
   apiKey?: string;
   baseURL: string;
@@ -57,7 +64,22 @@ export interface Config {
   thinkingModeConfigured?: boolean;
   /** True when the key came from the environment — don't persist it to disk. */
   apiKeyFromEnv?: boolean;
+  /** Named API-key profiles the user can switch between with /key. */
+  apiKeys?: Record<string, ApiKeyProfile>;
+  /** Name of the currently selected profile in apiKeys. */
+  activeApiKey?: string;
 }
+
+/** Mask a secret for display, e.g. "sk-86214…bd47" → "sk-86…bd47". */
+export function maskKey(key: string | undefined): string {
+  const k = (key ?? "").trim();
+  if (!k) return "";
+  if (k.length <= 10) return k.slice(0, 2) + "…" + k.slice(-2);
+  return k.slice(0, 5) + "…" + k.slice(-4);
+}
+
+/** The conventional name used when the env var supplies the key. */
+export const ENV_KEY_NAME = "env";
 
 const CONFIG_DIR = path.join(os.homedir(), ".deepseek-cli");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -89,6 +111,28 @@ export function loadConfig(): Config {
     thinkingMode: thinkingModeConfigured ? (savedThinkingMode ?? DEFAULTS.thinkingMode) : DEFAULTS.thinkingMode,
     thinkingModeConfigured,
   };
+
+  // Normalize the profile map and migrate any legacy single key into it.
+  const apiKeys: Record<string, ApiKeyProfile> = { ...(fileConfig.apiKeys ?? {}) };
+  if (fileConfig.apiKey && Object.keys(apiKeys).length === 0) {
+    apiKeys.default = { key: fileConfig.apiKey };
+    if (!config.activeApiKey) config.activeApiKey = "default";
+  }
+  config.apiKeys = apiKeys;
+  // Drop a stale active pointer that no longer matches a profile.
+  if (config.activeApiKey && !apiKeys[config.activeApiKey]) {
+    config.activeApiKey = Object.keys(apiKeys)[0];
+  } else if (!config.activeApiKey && Object.keys(apiKeys).length > 0) {
+    config.activeApiKey = Object.keys(apiKeys)[0];
+  }
+
+  // Resolve the effective key from the active profile (file-based).
+  config.apiKeyFromEnv = false;
+  if (config.activeApiKey && apiKeys[config.activeApiKey]) {
+    const profile = apiKeys[config.activeApiKey];
+    config.apiKey = profile.key;
+    if (profile.baseURL) config.baseURL = profile.baseURL;
+  }
 
   // Environment variables take precedence over the stored file.
   if (process.env.DEEPSEEK_API_KEY) {
@@ -122,8 +166,17 @@ export function saveConfig(config: Config): void {
     toStore.thinkingMode = config.thinkingMode;
     toStore.thinkingModeConfigured = true;
   }
-  // Never write an environment-provided key to disk.
-  if (config.apiKey && !config.apiKeyFromEnv) toStore.apiKey = config.apiKey;
+  // Persist named key profiles (these are user-entered, never the env key).
+  const profiles = config.apiKeys ?? {};
+  if (Object.keys(profiles).length > 0) {
+    toStore.apiKeys = profiles;
+    if (config.activeApiKey && profiles[config.activeApiKey]) {
+      toStore.activeApiKey = config.activeApiKey;
+    }
+  } else if (config.apiKey && !config.apiKeyFromEnv) {
+    // Legacy single-key fallback when no profiles exist.
+    toStore.apiKey = config.apiKey;
+  }
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(toStore, null, 2), "utf8");
 }
 

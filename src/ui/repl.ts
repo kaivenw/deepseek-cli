@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import readline from "node:readline";
 import fs from "node:fs";
 import type { Agent, GenerationInputController } from "../agent.js";
-import type { Config } from "../config.js";
+import { maskKey, type Config } from "../config.js";
 import { isCommand, runCommand, suggestCommands } from "../commands.js";
 import { ui, chalk } from "./render.js";
 import { loadSession, saveSession } from "../session.js";
@@ -777,12 +777,14 @@ export async function startRepl(agent: Agent, config: Config): Promise<void> {
   }
 
   const mcp = mcpStatus();
+  const keyName = config.apiKeyFromEnv ? "env" : (config.activeApiKey ?? "default");
   ui.banner(config.model, process.cwd(), {
     sessionMsg: sessionRestored
       ? "session: restored (" + agent.messageCount() + " messages" + (agent.getContextSummary() ? ", compressed context active" : "") + ")"
       : undefined,
     mcpTools: mcp.infos.length,
     mcpErrors: mcp.errors.length,
+    apiKeyLabel: config.apiKey ? keyName + " · " + maskKey(config.apiKey) : undefined,
   });
 
   agent.sessionStart();

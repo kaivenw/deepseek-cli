@@ -133,3 +133,29 @@ export class DeepSeekClient {
       }));
   }
 }
+
+/**
+ * Lightweight check that a key/endpoint pair works, via a models.list call.
+ * Never throws; returns the failure reason instead so callers can show ✓/✗.
+ */
+export async function validateApiKey(
+  apiKey: string,
+  baseURL: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const client = new DeepSeekClient({
+      apiKey,
+      baseURL,
+      model: "",
+      alwaysAllow: [],
+      thinkingMode: "off",
+    });
+    await client.listModels();
+    return { ok: true };
+  } catch (err) {
+    const status = (err as { status?: number })?.status;
+    let message = (err as Error)?.message ?? String(err);
+    if (status === 401 || status === 403) message = "Invalid or unauthorized API key.";
+    return { ok: false, error: message };
+  }
+}

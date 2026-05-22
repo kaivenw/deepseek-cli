@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { execSync } from "node:child_process";
-import { select } from "@inquirer/prompts";
+import { select, input, password, confirm } from "@inquirer/prompts";
 import type { Agent, GenerationInputController } from "./agent.js";
 import {
   MODELS,
@@ -8,9 +8,13 @@ import {
   saveConfig,
   configPath,
   normalizeThinkingMode,
+  maskKey,
+  DEFAULT_BASE_URL,
   type Config,
+  type ApiKeyProfile,
   type ThinkingMode,
 } from "./config.js";
+import { validateApiKey } from "./client.js";
 import { findProjectRoot, loadProjectMemory, projectMemoryTarget } from "./project.js";
 import { addNote, clearNotes, listNotes, removeNote } from "./btw.js";
 import {
@@ -35,7 +39,7 @@ import {
   updatePlugin,
 } from "./plugins.js";
 import { ALL_TOOLS, clearExternalTools, registerExternalTools } from "./tools/index.js";
-import { ui, chalk } from "./ui/render.js";
+import { ui, chalk, Spinner } from "./ui/render.js";
 import { saveSession, loadSession, deleteSession } from "./session.js";
 import { createHooksTemplate, hooksPath, loadHooks } from "./hooks.js";
 import { claudeMcpPath, createMcpTemplate, globalMcpPath, loadMcpTools, mcpStatus, projectMcpPath } from "./mcp.js";
@@ -61,6 +65,7 @@ export const COMMANDS: CommandInfo[] = [
   { name: "help", aliases: ["?"], usage: "/help", description: "show this help" },
   { name: "model", usage: "/model", description: "choose a model with arrow keys" },
   { name: "models", usage: "/models", description: "fetch and list available DeepSeek models" },
+  { name: "key", aliases: ["keys"], usage: "/key [add|use|rm|list]", description: "switch, add or remove API keys" },
   { name: "skills", usage: "/skills", description: "list custom skill commands" },
   { name: "skill-new", usage: "/skill-new <name>", description: "create a project skill template" },
   { name: "plugin", aliases: ["plugins"], usage: "/plugin <list|search|install|new|remove|...>", description: "install and manage plugins" },
@@ -322,6 +327,11 @@ export async function runCommand(input: string, ctx: CommandContext): Promise<Co
 
     case "models":
       await printModels(ctx);
+      return {};
+
+    case "key":
+    case "keys":
+      await handleKey(rest, ctx);
       return {};
 
     case "skills":
@@ -964,6 +974,283 @@ async function handleModel(ctx: CommandContext): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// /key — manage named API-key profiles (switch / add / remove / list)
+// ---------------------------------------------------------------------------
+
+function ensureApiKeys(config: Config): Record<string, ApiKeyProfile> {
+  if (!config.apiKeys) config.apiKeys = {};
+  return config.apiKeys;
+}
+
+async function handleKey(args: string[], ctx: CommandContext): Promise<void> {
+  const sub = (args[0] ?? "").toLowerCase();
+  const rest = args.slice(1);
+  switch (sub) {
+    case "":
+      await handleKeyInteractive(ctx);
+      return;
+    case "list":
+    case "ls":
+      printKeys(ctx);
+      return;
+    case "add":
+    case "new":
+      await handleKeyAdd(ctx);
+      return;
+    case "use":
+    case "switch":
+      await handleKeyUse(rest.join(" ").trim(), ctx);
+      return;
+    case "rm":
+    case "remove":
+    case "delete":
+      await handleKeyRemove(rest.join(" ").trim(), ctx);
+      return;
+    default:
+      ui.warn("Usage: /key [add | use <name> | rm <name> | list]");
+  }
+}
+
+/** Validate a key via models.list with a spinner; prints ✓/✗ and returns the result. */
+async function validateKeyWithSpinner(key: string, baseURL: string): Promise<boolean> {
+  const spinner = new Spinner("Validating key…");
+  spinner.start();
+  const result = await validateApiKey(key, baseURL);
+  spinner.stop();
+  if (result.ok) {
+    ui.success("  ✓ Key is valid.");
+    return true;
+  }
+  ui.error("  ✗ " + (result.error ?? "Validation failed."));
+  return false;
+}
+
+interface SwitchOptions {
+  /** Skip the live validation request (e.g. just-validated, or known-good). */
+  alreadyValidated?: boolean;
+}
+
+/** Point the live client + persisted config at a profile. Keeps the session. */
+async function switchToProfile(
+  name: string,
+  profile: ApiKeyProfile,
+  ctx: CommandContext,
+  opts: SwitchOptions = {},
+): Promise<boolean> {
+  const baseURL = profile.baseURL ?? ctx.config.baseURL;
+  if (!opts.alreadyValidated) {
+    const ok = await validateKeyWithSpinner(profile.key, baseURL);
+    if (!ok) {
+      ui.info("Keeping the current key.");
+      return false;
+    }
+  }
+  ctx.agent.setApiKey(profile.key, profile.baseURL);
+  ctx.config.apiKey = profile.key;
+  ctx.config.apiKeyFromEnv = false;
+  if (profile.baseURL) ctx.config.baseURL = profile.baseURL;
+  ctx.config.activeApiKey = name;
+  try {
+    saveConfig(ctx.config);
+  } catch (err) {
+    ui.warn(`Could not save config: ${(err as Error).message}`);
+  }
+  ui.success(`Switched to ${chalk.green(name)} ${chalk.dim(maskKey(profile.key))}.`);
+  if (process.env.DEEPSEEK_API_KEY) {
+    ui.info(chalk.dim("Note: DEEPSEEK_API_KEY is set and will override this on next launch."));
+  }
+  return true;
+}
+
+function printKeys(ctx: CommandContext): void {
+  const profiles = ensureApiKeys(ctx.config);
+  const names = Object.keys(profiles);
+  console.log();
+  if (ctx.config.apiKeyFromEnv) {
+    console.log(
+      `  ${chalk.green("●")} ${chalk.bold("(env)")} ${chalk.dim(maskKey(ctx.config.apiKey))} ${chalk.dim("· from DEEPSEEK_API_KEY (active)")}`,
+    );
+  }
+  if (names.length === 0) {
+    if (!ctx.config.apiKeyFromEnv) ui.info("  No saved API keys. Add one with /key add.");
+    console.log();
+    return;
+  }
+  for (const name of names) {
+    const active = !ctx.config.apiKeyFromEnv && ctx.config.activeApiKey === name;
+    const marker = active ? chalk.green("●") : " ";
+    const base = profiles[name].baseURL ? chalk.dim(" · " + profiles[name].baseURL) : "";
+    const tag = active ? chalk.dim(" (active)") : "";
+    console.log(`  ${marker} ${chalk.bold(name)} ${chalk.dim(maskKey(profiles[name].key))}${base}${tag}`);
+  }
+  if (ctx.config.apiKeyFromEnv) {
+    console.log();
+    ui.info("  The DEEPSEEK_API_KEY env var overrides saved keys on launch.");
+  }
+  console.log();
+}
+
+async function handleKeyInteractive(ctx: CommandContext): Promise<void> {
+  const profiles = ensureApiKeys(ctx.config);
+  const names = Object.keys(profiles);
+
+  const choices: { name: string; value: string; description?: string }[] = [];
+  if (ctx.config.apiKeyFromEnv) {
+    choices.push({
+      name: `(env) ${chalk.dim(maskKey(ctx.config.apiKey))} ${chalk.green("●")}`,
+      value: "__env__",
+      description: "Active — supplied by DEEPSEEK_API_KEY",
+    });
+  }
+  for (const name of names) {
+    const active = !ctx.config.apiKeyFromEnv && ctx.config.activeApiKey === name;
+    choices.push({
+      name: `${name}  ${chalk.dim(maskKey(profiles[name].key))}${active ? chalk.green(" ●") : ""}`,
+      value: `use:${name}`,
+      description: profiles[name].baseURL ?? DEFAULT_BASE_URL,
+    });
+  }
+  choices.push({ name: chalk.cyan("＋ Add a new key"), value: "__add__" });
+  if (names.length > 0) choices.push({ name: chalk.dim("✕ Remove a key"), value: "__rm__" });
+  choices.push({ name: chalk.dim("Cancel"), value: "__cancel__" });
+
+  const action = await select({ message: "API keys", choices });
+  if (action === "__cancel__" || action === "__env__") return;
+  if (action === "__add__") {
+    await handleKeyAdd(ctx);
+    return;
+  }
+  if (action === "__rm__") {
+    const target = await select({
+      message: "Remove which key?",
+      choices: [
+        ...names.map((n) => ({ name: `${n}  ${chalk.dim(maskKey(profiles[n].key))}`, value: n })),
+        { name: chalk.dim("Cancel"), value: "" },
+      ],
+    });
+    if (target) await handleKeyRemove(target, ctx);
+    return;
+  }
+  if (action.startsWith("use:")) {
+    const name = action.slice(4);
+    if (!ctx.config.apiKeyFromEnv && ctx.config.activeApiKey === name) {
+      ui.info(`'${name}' is already active.`);
+      return;
+    }
+    await switchToProfile(name, profiles[name], ctx);
+  }
+}
+
+async function handleKeyUse(name: string, ctx: CommandContext): Promise<void> {
+  const profiles = ensureApiKeys(ctx.config);
+  if (!name) {
+    ui.warn("Usage: /key use <name>");
+    if (Object.keys(profiles).length) ui.info("  Available: " + Object.keys(profiles).join(", "));
+    return;
+  }
+  const profile = profiles[name];
+  if (!profile) {
+    ui.error(`No key named '${name}'.`);
+    if (Object.keys(profiles).length) ui.info("  Available: " + Object.keys(profiles).join(", "));
+    return;
+  }
+  if (!ctx.config.apiKeyFromEnv && ctx.config.activeApiKey === name) {
+    ui.info(`'${name}' is already active.`);
+    return;
+  }
+  await switchToProfile(name, profile, ctx);
+}
+
+async function handleKeyAdd(ctx: CommandContext): Promise<void> {
+  const profiles = ensureApiKeys(ctx.config);
+  const existing = new Set(Object.keys(profiles));
+
+  const suggested = existing.size === 0 ? "default" : undefined;
+  const name = (await input({ message: "Name for this key:", default: suggested })).trim();
+  if (!name) {
+    ui.warn("Cancelled (no name).");
+    return;
+  }
+  if (existing.has(name)) {
+    const overwrite = await confirm({ message: `'${name}' already exists. Overwrite?`, default: false });
+    if (!overwrite) return;
+  }
+
+  const key = (await password({ message: "DeepSeek API key:", mask: "*" })).trim();
+  if (!key) {
+    ui.warn("Cancelled (no key).");
+    return;
+  }
+
+  const baseInput = (await input({ message: "API endpoint (blank = default):", default: DEFAULT_BASE_URL })).trim();
+  const baseURL = baseInput && baseInput !== DEFAULT_BASE_URL ? baseInput : undefined;
+
+  let validated = await validateKeyWithSpinner(key, baseURL ?? DEFAULT_BASE_URL);
+  if (!validated) {
+    const saveAnyway = await confirm({ message: "Save this key anyway?", default: false });
+    if (!saveAnyway) {
+      ui.info("Discarded.");
+      return;
+    }
+  }
+
+  profiles[name] = baseURL ? { key, baseURL } : { key };
+  const isFirstSavedKey = existing.size === 0;
+  try {
+    saveConfig(ctx.config);
+  } catch (err) {
+    ui.warn(`Could not save config: ${(err as Error).message}`);
+  }
+  ui.success(`Saved key '${chalk.green(name)}' ${chalk.dim(maskKey(key))}.`);
+
+  // Auto-activate the very first key (when nothing else is active); otherwise ask.
+  const autoSwitch = isFirstSavedKey && !ctx.config.apiKeyFromEnv && !ctx.config.activeApiKey;
+  const switchNow = autoSwitch || (await confirm({ message: `Switch to '${name}' now?`, default: true }));
+  if (switchNow) {
+    await switchToProfile(name, profiles[name], ctx, { alreadyValidated: validated });
+  }
+}
+
+async function handleKeyRemove(name: string, ctx: CommandContext): Promise<void> {
+  const profiles = ensureApiKeys(ctx.config);
+  if (name === "env" || name === "(env)") {
+    ui.warn("The env key can't be removed here — unset DEEPSEEK_API_KEY instead.");
+    return;
+  }
+  if (!name) {
+    ui.warn("Usage: /key rm <name>");
+    return;
+  }
+  if (!profiles[name]) {
+    ui.error(`No key named '${name}'.`);
+    return;
+  }
+
+  const confirmed = await confirm({ message: `Remove key '${name}'?`, default: false });
+  if (!confirmed) return;
+
+  const wasActive = ctx.config.activeApiKey === name;
+  delete profiles[name];
+  if (wasActive) ctx.config.activeApiKey = Object.keys(profiles)[0];
+  try {
+    saveConfig(ctx.config);
+  } catch (err) {
+    ui.warn(`Could not save config: ${(err as Error).message}`);
+  }
+  ui.success(`Removed '${name}'.`);
+
+  // If the live (non-env) key was removed, re-point to a remaining profile.
+  if (wasActive && !ctx.config.apiKeyFromEnv) {
+    const next = ctx.config.activeApiKey;
+    if (next && profiles[next]) {
+      await switchToProfile(next, profiles[next], ctx, { alreadyValidated: true });
+    } else {
+      ui.warn("No API keys left. Add one with /key add (or set DEEPSEEK_API_KEY).");
+    }
+  }
+}
+
 function handleThinking(arg: string, ctx: CommandContext): void {
   const current: ThinkingMode = ctx.config.thinkingMode ?? "off";
 
@@ -1040,9 +1327,17 @@ function printConfig(config: Config): void {
   console.log();
   console.log(`  ${chalk.dim("model:   ")} ${config.model}`);
   console.log(`  ${chalk.dim("baseURL: ")} ${config.baseURL}`);
-  console.log(
-    `  ${chalk.dim("api key: ")} ${config.apiKey ? chalk.green("set") + (config.apiKeyFromEnv ? chalk.dim(" (from env)") : "") : chalk.red("missing")}`,
-  );
+  const keyName = config.apiKeyFromEnv ? "env" : config.activeApiKey;
+  const keyLabel = config.apiKey
+    ? chalk.green("set") +
+      chalk.dim(" " + maskKey(config.apiKey)) +
+      (keyName ? chalk.dim(` (${keyName})`) : "")
+    : chalk.red("missing");
+  console.log(`  ${chalk.dim("api key: ")} ${keyLabel}`);
+  const keyCount = Object.keys(config.apiKeys ?? {}).length;
+  if (keyCount > 1) {
+    console.log(`  ${chalk.dim("keys:    ")} ${keyCount} saved ${chalk.dim("(switch with /key)")}`);
+  }
   console.log(
     `  ${chalk.dim("thinking:")} ${(config.thinkingMode ?? "off") === "off" ? chalk.yellow("off") : chalk.green(config.thinkingMode)}`,
   );

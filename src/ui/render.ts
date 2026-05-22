@@ -6,9 +6,11 @@ interface BannerOptions {
   sessionMsg?: string;
   mcpTools?: number;
   mcpErrors?: number;
+  /** Active API-key label (name + masked value), shown in the banner. */
+  apiKeyLabel?: string;
 }
 
-const CLI_VERSION = "0.1.8";
+const CLI_VERSION = "0.1.9";
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
@@ -148,6 +150,7 @@ export const ui = {
         "",
         chalk.dim(sessionLine),
         chalk.dim("MCP:     ") + chalk.dim(mcpText + mcpErrorText),
+        ...(options.apiKeyLabel ? [chalk.dim("API key: ") + chalk.dim(options.apiKeyLabel)] : []),
       ];
       const rows = Math.max(leftLines.length, rightLines.length);
       for (let i = 0; i < rows; i++) {
@@ -165,6 +168,7 @@ export const ui = {
         centerDisplay(chalk.dim(cwd), innerWidth),
         centerDisplay(chalk.dim(sessionLine), innerWidth),
         centerDisplay(chalk.dim("MCP: " + mcpText + mcpErrorText), innerWidth),
+        ...(options.apiKeyLabel ? [centerDisplay(chalk.dim("API key: " + options.apiKeyLabel), innerWidth)] : []),
         "",
         "  " + accent.bold("Tips") + " " + chalk.dim("/init · / · @file · drag-in · #note · !cmd · /mcp"),
         "",
