@@ -12,6 +12,8 @@ import { TodoStore, type TodoItem } from "./todo.js";
 import { runHooks } from "./hooks.js";
 import { isPdf, extractPdfText, isProbablyBinaryFile } from "./pdf.js";
 import { isDocx, extractDocxText } from "./docx.js";
+import { isPptx, extractPptxText, isXlsx, extractXlsxText } from "./office.js";
+import { ocrEnabled, ocrImageFile } from "./ocr.js";
 import type OpenAI from "openai";
 
 const MAX_TOOL_ITERATIONS = 25;
@@ -89,6 +91,16 @@ async function expandFileMentions(input: string, cwd: string): Promise<string> {
         } else {
           blocks.push(`### @${rel} (Word doc)\n[could not extract text: ${result.error}]`);
         }
+        continue;
+      }
+      if (isPptx(abs)) {
+        const result = await extractPptxText(abs, MAX_MENTION_CHARS);
+        blocks.push(result.ok ? `### @${rel} (PowerPoint)\n${result.text}` : `### @${rel} (PowerPoint)\n[could not extract text: ${result.error}]`);
+        continue;
+      }
+      if (isXlsx(abs)) {
+        const result = await extractXlsxText(abs, MAX_MENTION_CHARS);
+        blocks.push(result.ok ? `### @${rel} (Excel)\n${result.text}` : `### @${rel} (Excel)\n[could not extract text: ${result.error}]`);
         continue;
       }
       if (isProbablyBinaryFile(abs)) {
@@ -653,9 +665,19 @@ export class Agent {
       const ext = path.extname(file).toLowerCase();
       try {
         if (isPdf(file)) {
-          const result = await extractPdfText(file, MAX_MENTION_CHARS);
+          let ocrSpinner: Spinner | null = null;
+          const result = await extractPdfText(file, MAX_MENTION_CHARS, {
+            onOcrPage: () => {
+              if (!ocrSpinner) {
+                ocrSpinner = new Spinner(`OCR scanned PDF ${path.basename(file)}…`);
+                ocrSpinner.start();
+              }
+            },
+          });
+          (ocrSpinner as Spinner | null)?.stop();
           if (result.ok) {
-            textContent += `\n\n--- Attached PDF: ${file} (${result.pages} page(s)) ---\n${result.text}`;
+            const tag = result.ocr ? "OCR" : `${result.pages} page(s)`;
+            textContent += `\n\n--- Attached PDF: ${file} (${tag}) ---\n${result.text}`;
           } else {
             ui.warn(`PDF ${path.basename(file)}: ${result.error}`);
             textContent += `\n\n[Attached PDF ${path.basename(file)} could not be read: ${result.error}]`;
@@ -668,9 +690,36 @@ export class Agent {
             ui.warn(`Word doc ${path.basename(file)}: ${result.error}`);
             textContent += `\n\n[Attached Word doc ${path.basename(file)} could not be read: ${result.error}]`;
           }
+        } else if (isPptx(file)) {
+          const result = await extractPptxText(file, MAX_MENTION_CHARS);
+          if (result.ok) {
+            textContent += `\n\n--- Attached PowerPoint: ${file} ---\n${result.text}`;
+          } else {
+            ui.warn(`PowerPoint ${path.basename(file)}: ${result.error}`);
+            textContent += `\n\n[Attached PowerPoint ${path.basename(file)} could not be read: ${result.error}]`;
+          }
+        } else if (isXlsx(file)) {
+          const result = await extractXlsxText(file, MAX_MENTION_CHARS);
+          if (result.ok) {
+            textContent += `\n\n--- Attached Excel: ${file} ---\n${result.text}`;
+          } else {
+            ui.warn(`Excel ${path.basename(file)}: ${result.error}`);
+            textContent += `\n\n[Attached Excel ${path.basename(file)} could not be read: ${result.error}]`;
+          }
         } else if (IMAGE_EXT.has(ext)) {
           // DeepSeek chat models are text-only; only send images to vision models.
           if (!visionSupported) {
+            // Fall back to OCR so text in the image still reaches the model.
+            if (ocrEnabled() && ext !== ".svg") {
+              const ocrSpinner = new Spinner(`OCR image ${path.basename(file)}…`);
+              ocrSpinner.start();
+              const result = await ocrImageFile(file, MAX_MENTION_CHARS);
+              ocrSpinner.stop();
+              if (result.ok) {
+                textContent += `\n\n--- Text from image (OCR): ${path.basename(file)} ---\n${result.text}`;
+                continue;
+              }
+            }
             const kb = (() => { try { return Math.round(fs.statSync(file).size / 1024); } catch { return 0; } })();
             ui.warn(`Image ${path.basename(file)} not sent: model '${this.config.model}' has no vision support.`);
             textContent += `\n\n[Attached image ${path.basename(file)} (${kb} KB) was not sent because the current model cannot view images.]`;

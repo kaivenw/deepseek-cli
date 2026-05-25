@@ -1,11 +1,21 @@
 import fs from "node:fs";
+import { ocrEnabled, ocrPdf } from "./ocr.js";
 
 export interface PdfExtractResult {
   ok: boolean;
   text?: string;
   pages?: number;
   truncated?: boolean;
+  /** True when the text came from OCR (scanned PDF) rather than the text layer. */
+  ocr?: boolean;
   error?: string;
+}
+
+export interface PdfExtractOptions {
+  /** Run OCR when the PDF has no text layer. Defaults to ocrEnabled(). */
+  ocr?: boolean;
+  /** Progress callback during OCR (slow). */
+  onOcrPage?: (page: number, total: number) => void;
 }
 
 export function isPdf(filePath: string): boolean {
@@ -15,8 +25,13 @@ export function isPdf(filePath: string): boolean {
 /**
  * Extract plain text from a PDF using unpdf (a pure-JS bundle of pdf.js — no
  * native dependencies). Imported lazily so it only loads when a PDF is opened.
+ * Scanned PDFs (no text layer) fall back to OCR when enabled.
  */
-export async function extractPdfText(absPath: string, maxChars = 50_000): Promise<PdfExtractResult> {
+export async function extractPdfText(
+  absPath: string,
+  maxChars = 50_000,
+  opts: PdfExtractOptions = {},
+): Promise<PdfExtractResult> {
   try {
     const { extractText, getDocumentProxy } = await import("unpdf");
     const data = new Uint8Array(fs.readFileSync(absPath));
@@ -24,10 +39,22 @@ export async function extractPdfText(absPath: string, maxChars = 50_000): Promis
     const { totalPages, text } = await extractText(pdf, { mergePages: true });
     let merged = (typeof text === "string" ? text : (text as unknown as string[]).join("\n\n")).trim();
     if (!merged) {
+      // No text layer → likely scanned. Try OCR if enabled.
+      if (opts.ocr ?? ocrEnabled()) {
+        const result = await ocrPdf(absPath, maxChars, 20, opts.onOcrPage);
+        if (result.ok) {
+          return { ok: true, text: result.text, pages: result.pages ?? totalPages, ocr: true };
+        }
+        return {
+          ok: false,
+          pages: totalPages,
+          error: `scanned PDF — OCR failed: ${result.error}${result.hint ? ` (${result.hint})` : ""}`,
+        };
+      }
       return {
         ok: false,
         pages: totalPages,
-        error: "no extractable text (the PDF is likely scanned images; OCR is not supported)",
+        error: "no extractable text (likely scanned; OCR disabled via DEEPSEEK_OCR)",
       };
     }
     const truncated = merged.length > maxChars;

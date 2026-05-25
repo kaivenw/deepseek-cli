@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Tool } from "./types.js";
 import { isPdf, extractPdfText, isProbablyBinaryFile } from "../pdf.js";
 import { isDocx, extractDocxText } from "../docx.js";
+import { isPptx, extractPptxText, isXlsx, extractXlsxText } from "../office.js";
 
 const MAX_LINES = 2000;
 const MAX_LINE_LEN = 2000;
@@ -69,6 +70,30 @@ export const readTool: Tool = {
       return {
         content: header + result.text,
         summary: `Read Word doc ${rel}`,
+      };
+    }
+
+    // PowerPoint (.pptx) — extract slide text.
+    if (isPptx(abs)) {
+      const result = await extractPptxText(abs);
+      if (!result.ok) {
+        return { content: `Error: could not read PowerPoint ${rel}: ${result.error}`, isError: true };
+      }
+      return {
+        content: `[Extracted text from PowerPoint: ${rel}${result.truncated ? " · truncated" : ""}]\n\n${result.text}`,
+        summary: `Read PowerPoint ${rel}`,
+      };
+    }
+
+    // Excel (.xlsx) — extract cell text per sheet.
+    if (isXlsx(abs)) {
+      const result = await extractXlsxText(abs);
+      if (!result.ok) {
+        return { content: `Error: could not read Excel ${rel}: ${result.error}`, isError: true };
+      }
+      return {
+        content: `[Extracted text from Excel: ${rel}${result.truncated ? " · truncated" : ""}]\n\n${result.text}`,
+        summary: `Read Excel ${rel}`,
       };
     }
 

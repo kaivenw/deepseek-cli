@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { decodeXmlEntities } from "./xml.js";
 
 export interface DocxExtractResult {
   ok: boolean;
@@ -9,17 +10,6 @@ export interface DocxExtractResult {
 
 export function isDocx(filePath: string): boolean {
   return filePath.toLowerCase().endsWith(".docx");
-}
-
-function decodeXmlEntities(text: string): string {
-  return text
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
-    .replace(/&amp;/g, "&"); // last, so decoded text doesn't re-trigger
 }
 
 /** Turn WordprocessingML markup into plain text (paragraphs → newlines). */
