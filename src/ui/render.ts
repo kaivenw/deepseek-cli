@@ -1,5 +1,4 @@
 import chalk from "chalk";
-import os from "node:os";
 import type { Usage } from "../client.js";
 
 interface BannerOptions {
@@ -10,7 +9,7 @@ interface BannerOptions {
   apiKeyLabel?: string;
 }
 
-const CLI_VERSION = "0.3.0";
+const CLI_VERSION = "0.4.0";
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
@@ -108,7 +107,6 @@ export const ui = {
     const title = "─ DeepSeek CLI v" + CLI_VERSION + " ";
     const top = accent("╭" + title + "─".repeat(Math.max(0, innerWidth - displayWidth(title))) + "╮");
     const bottom = accent("╰" + "─".repeat(innerWidth) + "╯");
-    const user = os.userInfo().username || "there";
     const mcpText = options.mcpTools && options.mcpTools > 0
       ? options.mcpTools + " tool" + (options.mcpTools === 1 ? "" : "s") + " loaded"
       : "/mcp init to add tools";
@@ -127,7 +125,7 @@ export const ui = {
       const logo = deepSeekLogo();
       const leftLines = [
         "",
-        centerDisplay(chalk.bold("Welcome back " + user + "!"), leftWidth),
+        centerDisplay(chalk.bold("Welcome to DeepSeek CLI"), leftWidth),
         "",
         ...logo.map((line) => centerDisplay(line, leftWidth)),
         "",
@@ -160,7 +158,7 @@ export const ui = {
       const logo = deepSeekLogo();
       const lines = [
         "",
-        centerDisplay(chalk.bold("Welcome back " + user + "!"), innerWidth),
+        centerDisplay(chalk.bold("Welcome to DeepSeek CLI"), innerWidth),
         "",
         ...logo.map((line) => centerDisplay(line, innerWidth)),
         "",

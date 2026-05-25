@@ -119,7 +119,7 @@ async function main(): Promise<void> {
   program
     .name("deepseek")
     .description("An agentic coding CLI for DeepSeek models")
-    .version("0.3.0")
+    .version("0.4.0")
     .argument("[prompt...]", "run a one-shot prompt instead of the interactive REPL")
     .option("-m, --model <model>", "model to use (e.g. deepseek-v4-pro, deepseek-v4-flash)")
     .option("-p, --print", "print mode: run the prompt once and exit")

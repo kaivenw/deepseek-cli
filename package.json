@@ -1,6 +1,6 @@
 {
   "name": "@kavienw/deepseek-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "An agentic coding CLI for DeepSeek models, in the spirit of Claude Code",
   "type": "module",
   "bin": {
@@ -36,6 +36,7 @@
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "diff": "^7.0.0",
+    "fflate": "^0.8.3",
     "glob": "^11.0.0",
     "openai": "^4.77.0",
     "unpdf": "^1.6.2"

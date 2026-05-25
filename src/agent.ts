@@ -11,6 +11,7 @@ import { ui, chalk, Spinner } from "./ui/render.js";
 import { TodoStore, type TodoItem } from "./todo.js";
 import { runHooks } from "./hooks.js";
 import { isPdf, extractPdfText, isProbablyBinaryFile } from "./pdf.js";
+import { isDocx, extractDocxText } from "./docx.js";
 import type OpenAI from "openai";
 
 const MAX_TOOL_ITERATIONS = 25;
@@ -78,6 +79,15 @@ async function expandFileMentions(input: string, cwd: string): Promise<string> {
           blocks.push(`### @${rel} (PDF, ${result.pages} page(s))\n${result.text}`);
         } else {
           blocks.push(`### @${rel} (PDF)\n[could not extract text: ${result.error}]`);
+        }
+        continue;
+      }
+      if (isDocx(abs)) {
+        const result = await extractDocxText(abs, MAX_MENTION_CHARS);
+        if (result.ok) {
+          blocks.push(`### @${rel} (Word doc)\n${result.text}`);
+        } else {
+          blocks.push(`### @${rel} (Word doc)\n[could not extract text: ${result.error}]`);
         }
         continue;
       }
@@ -649,6 +659,14 @@ export class Agent {
           } else {
             ui.warn(`PDF ${path.basename(file)}: ${result.error}`);
             textContent += `\n\n[Attached PDF ${path.basename(file)} could not be read: ${result.error}]`;
+          }
+        } else if (isDocx(file)) {
+          const result = await extractDocxText(file, MAX_MENTION_CHARS);
+          if (result.ok) {
+            textContent += `\n\n--- Attached Word doc: ${file} ---\n${result.text}`;
+          } else {
+            ui.warn(`Word doc ${path.basename(file)}: ${result.error}`);
+            textContent += `\n\n[Attached Word doc ${path.basename(file)} could not be read: ${result.error}]`;
           }
         } else if (IMAGE_EXT.has(ext)) {
           // DeepSeek chat models are text-only; only send images to vision models.

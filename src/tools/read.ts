@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Tool } from "./types.js";
 import { isPdf, extractPdfText, isProbablyBinaryFile } from "../pdf.js";
+import { isDocx, extractDocxText } from "../docx.js";
 
 const MAX_LINES = 2000;
 const MAX_LINE_LEN = 2000;
@@ -55,6 +56,19 @@ export const readTool: Tool = {
       return {
         content: header + result.text,
         summary: `Read PDF ${rel} (${result.pages} pages)`,
+      };
+    }
+
+    // Word documents (.docx) are zipped XML — extract the body text.
+    if (isDocx(abs)) {
+      const result = await extractDocxText(abs);
+      if (!result.ok) {
+        return { content: `Error: could not read Word doc ${rel}: ${result.error}`, isError: true };
+      }
+      const header = `[Extracted text from Word doc: ${rel}${result.truncated ? " · truncated" : ""}]\n\n`;
+      return {
+        content: header + result.text,
+        summary: `Read Word doc ${rel}`,
       };
     }
 
