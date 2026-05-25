@@ -10,7 +10,7 @@ interface BannerOptions {
   apiKeyLabel?: string;
 }
 
-const CLI_VERSION = "0.2.0";
+const CLI_VERSION = "0.3.0";
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");

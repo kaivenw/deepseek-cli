@@ -90,14 +90,16 @@ const FILE_INDEX_CAP = 8000;
 const FILE_INDEX_IGNORE = new Set([
   "node_modules", ".git", "dist", "build", ".next", "target", ".idea", ".cache", "coverage",
 ]);
-let fileIndexCache: { cwd: string; files: string[]; time: number } | null = null;
+let fileIndexCache: { cwd: string; files: string[]; dirs: string[]; time: number } | null = null;
 
-function indexProjectFiles(cwd: string): string[] {
+/** Index the project's files and directories (bounded, cached) for @-completion. */
+function indexProject(cwd: string): { files: string[]; dirs: string[] } {
   const now = Date.now();
   if (fileIndexCache && fileIndexCache.cwd === cwd && now - fileIndexCache.time < FILE_INDEX_TTL_MS) {
-    return fileIndexCache.files;
+    return { files: fileIndexCache.files, dirs: fileIndexCache.dirs };
   }
   const files: string[] = [];
+  const dirs: string[] = [];
   const walk = (dir: string, rel: string): void => {
     if (files.length >= FILE_INDEX_CAP) return;
     let entries: fs.Dirent[];
@@ -110,22 +112,26 @@ function indexProjectFiles(cwd: string): string[] {
       if (files.length >= FILE_INDEX_CAP) return;
       const childRel = rel ? rel + "/" + entry.name : entry.name;
       if (entry.isDirectory()) {
-        if (!FILE_INDEX_IGNORE.has(entry.name)) walk(path.join(dir, entry.name), childRel);
+        if (!FILE_INDEX_IGNORE.has(entry.name)) {
+          dirs.push(childRel);
+          walk(path.join(dir, entry.name), childRel);
+        }
       } else if (entry.isFile()) {
         files.push(childRel);
       }
     }
   };
   walk(cwd, "");
-  fileIndexCache = { cwd, files, time: now };
-  return files;
+  fileIndexCache = { cwd, files, dirs, time: now };
+  return { files, dirs };
 }
 
-export function fuzzyFileMatch(files: string[], query: string, limit: number): string[] {
-  if (!query) return files.slice(0, limit);
+/** Score & sort all matching paths best-first (no limit). */
+function scorePaths(paths: string[], query: string): string[] {
+  if (!query) return paths;
   const q = query.toLowerCase();
   const scored: { file: string; score: number }[] = [];
-  for (const file of files) {
+  for (const file of paths) {
     const lower = file.toLowerCase();
     const base = lower.slice(lower.lastIndexOf("/") + 1);
     let score = -1;
@@ -144,7 +150,12 @@ export function fuzzyFileMatch(files: string[], query: string, limit: number): s
     if (score > -1) scored.push({ file, score });
   }
   scored.sort((a, b) => b.score - a.score || a.file.length - b.file.length);
-  return scored.slice(0, limit).map((s) => s.file);
+  return scored.map((s) => s.file);
+}
+
+export function fuzzyFileMatch(files: string[], query: string, limit: number): string[] {
+  if (!query) return files.slice(0, limit);
+  return scorePaths(files, query).slice(0, limit);
 }
 
 /** The @-mention token under the cursor, or null. */
@@ -156,14 +167,23 @@ export function atTokenRange(line: string, cursor: number): { start: number; que
   return { start, query: token.slice(1) };
 }
 
-/** Completions for the current line: slash commands, or @-mention files. */
-export function getCompletions(line: string, cursor: number, cwd: string): { kind: CompletionKind; items: Completion[] } {
+const COMPLETION_SHOW = 8;
+const DIR_SHOW = 3;
+
+/** Completions for the current line: slash commands, or @-mention files/dirs. */
+export function getCompletions(
+  line: string,
+  cursor: number,
+  cwd: string,
+): { kind: CompletionKind; items: Completion[]; total: number } {
   const trimmedStart = line.trimStart();
   if (trimmedStart.startsWith("/")) {
-    const commands = suggestCommands(trimmedStart.slice(1), { limit: 8, cwd });
+    // Fetch a generous slice so we can show an accurate "+N more" count.
+    const all = suggestCommands(trimmedStart.slice(1), { limit: 99, cwd });
     return {
       kind: "command",
-      items: commands.map((c) => ({
+      total: all.length,
+      items: all.slice(0, COMPLETION_SHOW).map((c) => ({
         label: c.usage,
         detail: c.description,
         replacement: c.usage.split(" ")[0],
@@ -174,21 +194,33 @@ export function getCompletions(line: string, cursor: number, cwd: string): { kin
   }
   const at = atTokenRange(line, cursor);
   if (at) {
-    const files = fuzzyFileMatch(indexProjectFiles(cwd), at.query, 8);
-    if (files.length > 0) {
-      return {
-        kind: "file",
-        items: files.map((f) => ({
-          label: "@" + f,
-          detail: "",
-          replacement: "@" + f + " ",
-          start: at.start,
-          end: cursor,
-        })),
-      };
-    }
+    const { files, dirs } = indexProject(cwd);
+    const dirMatches = scorePaths(dirs, at.query);
+    const fileMatches = scorePaths(files, at.query);
+    const total = dirMatches.length + fileMatches.length;
+    // Directories first (navigational): selecting one keeps the picker open so
+    // you can descend; files get a trailing space to close the @-mention.
+    const shownDirs = dirMatches.slice(0, DIR_SHOW);
+    const shownFiles = fileMatches.slice(0, COMPLETION_SHOW - shownDirs.length);
+    const items: Completion[] = [
+      ...shownDirs.map((d) => ({
+        label: "@" + d + "/",
+        detail: chalk.dim("dir"),
+        replacement: "@" + d + "/",
+        start: at.start,
+        end: cursor,
+      })),
+      ...shownFiles.map((f) => ({
+        label: "@" + f,
+        detail: "",
+        replacement: "@" + f + " ",
+        start: at.start,
+        end: cursor,
+      })),
+    ];
+    if (items.length > 0) return { kind: "file", total, items };
   }
-  return { kind: "none", items: [] };
+  return { kind: "none", items: [], total: 0 };
 }
 
 function completionRows(items: Completion[], selectedIndex: number): string[] {
@@ -381,13 +413,17 @@ export class QueuedInputController implements GenerationInputController {
   private repaint(): void {
     if (!this.active) return;
     const dots = ".".repeat((this.frame % 3) + 1);
-    const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}`;
+    // Keep the interrupt key bright and always next to the spinner. With a queue,
+    // Esc un-queues (Claude Code behaviour), so Ctrl+C is the interrupt key.
+    const interruptKey = this.queue.length > 0 ? "Ctrl+C" : "Esc";
+    const interruptHint = chalk.dim(" — ") + chalk.yellow.bold(interruptKey) + chalk.dim(" to interrupt");
+    const loadingLine = `${chalk.hex("#f4b860")("*")} ${chalk.hex("#f4b860")(this.status + dots)}${interruptHint}`;
     const queuedLines = this.queue.map(
       (msg, i) => "  " + chalk.dim(`⏳ ${i + 1}. ${this.truncate(msg, 64)}`),
     );
     const tipLine = this.queue.length > 0
-      ? "  " + chalk.dim("enter queues · ↑ edit queued · esc un-queues · ctrl+c interrupts")
-      : "  " + chalk.dim("enter queues next message · esc interrupts");
+      ? "  " + chalk.dim("enter queues · ↑ edit queued · esc un-queues last")
+      : "  " + chalk.dim("type to queue a follow-up message");
     const divider = chalk.dim("─".repeat(Math.min(process.stdout.columns || 60, 60)));
     const header = [loadingLine, ...queuedLines, tipLine, divider].join("\n");
     this.geom = renderPrompt(
@@ -578,9 +614,12 @@ export function readInteractiveLine(promptText: string, history: string[], cwd: 
             chalk.dim("   ^R older · ↵ accept · Esc cancel"),
         );
       } else {
-        const { items } = completions();
+        const { items, total } = completions();
         if (selectedSuggestion >= items.length) selectedSuggestion = Math.max(0, items.length - 1);
         rows = completionRows(items, selectedSuggestion);
+        if (total > items.length) {
+          rows.push(chalk.dim(`  …+${total - items.length} more · keep typing to narrow`));
+        }
         const modeLabel = modeProvider?.label() ?? "";
         if (modeLabel) rows.push(chalk.yellow("  ⏵⏵ " + modeLabel) + chalk.dim("  ·  shift+tab to cycle"));
         if (hint) rows.push(chalk.dim("  " + hint));

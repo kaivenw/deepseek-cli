@@ -10,6 +10,7 @@ import { formatProjectMemoryForPrompt } from "./project.js";
 import { ui, chalk, Spinner } from "./ui/render.js";
 import { TodoStore, type TodoItem } from "./todo.js";
 import { runHooks } from "./hooks.js";
+import { isPdf, extractPdfText, isProbablyBinaryFile } from "./pdf.js";
 import type OpenAI from "openai";
 
 const MAX_TOOL_ITERATIONS = 25;
@@ -57,20 +58,35 @@ export interface GenerationInputController {
 type UserContent = string | OpenAI.Chat.Completions.ChatCompletionContentPart[];
 
 /** Expand `@path` mentions in user input by appending the referenced file contents. */
-function expandFileMentions(input: string, cwd: string): string {
+async function expandFileMentions(input: string, cwd: string): Promise<string> {
   const seen = new Set<string>();
   const blocks: string[] = [];
   let match: RegExpExecArray | null;
+  const mentions: string[] = [];
   FILE_MENTION_RE.lastIndex = 0;
-  while ((match = FILE_MENTION_RE.exec(input)) !== null) {
-    const rel = match[2];
+  while ((match = FILE_MENTION_RE.exec(input)) !== null) mentions.push(match[2]);
+
+  for (const rel of mentions) {
     if (seen.has(rel)) continue;
     const abs = path.isAbsolute(rel) ? rel : path.join(cwd, rel);
     try {
       if (!fs.statSync(abs).isFile()) continue;
+      seen.add(rel);
+      if (isPdf(abs)) {
+        const result = await extractPdfText(abs, MAX_MENTION_CHARS);
+        if (result.ok) {
+          blocks.push(`### @${rel} (PDF, ${result.pages} page(s))\n${result.text}`);
+        } else {
+          blocks.push(`### @${rel} (PDF)\n[could not extract text: ${result.error}]`);
+        }
+        continue;
+      }
+      if (isProbablyBinaryFile(abs)) {
+        blocks.push(`### @${rel}\n[binary file not shown]`);
+        continue;
+      }
       let content = fs.readFileSync(abs, "utf8");
       if (content.length > MAX_MENTION_CHARS) content = content.slice(0, MAX_MENTION_CHARS) + "\n…[truncated]";
-      seen.add(rel);
       blocks.push(`### @${rel}\n\`\`\`\n${content}\n\`\`\``);
     } catch {
       // Not a readable file — leave the @token in place as plain text.
@@ -616,7 +632,7 @@ export class Agent {
   }
 
   /** Build a user message content, attaching files (text inline, images as image_url). */
-  private buildUserContent(text: string, attachments: string[]): { content: UserContent; estimate: string } {
+  private async buildUserContent(text: string, attachments: string[]): Promise<{ content: UserContent; estimate: string }> {
     let textContent = text;
     const imageParts: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] = [];
     const visionSupported =
@@ -626,7 +642,15 @@ export class Agent {
     for (const file of attachments) {
       const ext = path.extname(file).toLowerCase();
       try {
-        if (IMAGE_EXT.has(ext)) {
+        if (isPdf(file)) {
+          const result = await extractPdfText(file, MAX_MENTION_CHARS);
+          if (result.ok) {
+            textContent += `\n\n--- Attached PDF: ${file} (${result.pages} page(s)) ---\n${result.text}`;
+          } else {
+            ui.warn(`PDF ${path.basename(file)}: ${result.error}`);
+            textContent += `\n\n[Attached PDF ${path.basename(file)} could not be read: ${result.error}]`;
+          }
+        } else if (IMAGE_EXT.has(ext)) {
           // DeepSeek chat models are text-only; only send images to vision models.
           if (!visionSupported) {
             const kb = (() => { try { return Math.round(fs.statSync(file).size / 1024); } catch { return 0; } })();
@@ -642,6 +666,9 @@ export class Agent {
           const b64 = fs.readFileSync(file).toString("base64");
           const mime = ext === ".jpg" ? "image/jpeg" : ext === ".svg" ? "image/svg+xml" : `image/${ext.slice(1)}`;
           imageParts.push({ type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } });
+        } else if (isProbablyBinaryFile(file)) {
+          ui.warn(`Attachment ${path.basename(file)} looks binary; not sent as text.`);
+          textContent += `\n\n[Attached file ${path.basename(file)} is binary and was not included.]`;
         } else {
           let body = fs.readFileSync(file, "utf8");
           if (body.length > MAX_MENTION_CHARS) body = body.slice(0, MAX_MENTION_CHARS) + "\n…[truncated]";
@@ -673,8 +700,8 @@ export class Agent {
       return;
     }
 
-    const text = expandFileMentions(userInput, this.ctx.cwd);
-    const { content, estimate } = this.buildUserContent(text, options.attachments ?? []);
+    const text = await expandFileMentions(userInput, this.ctx.cwd);
+    const { content, estimate } = await this.buildUserContent(text, options.attachments ?? []);
 
     if (this.shouldAutoCompress(estimate)) {
       ui.warn(`Context is large (~${this.estimatedContextTokens(estimate).toLocaleString()} estimated tokens); compressing before continuing.`);

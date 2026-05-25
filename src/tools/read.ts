@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Tool } from "./types.js";
+import { isPdf, extractPdfText, isProbablyBinaryFile } from "../pdf.js";
 
 const MAX_LINES = 2000;
 const MAX_LINE_LEN = 2000;
@@ -42,6 +43,27 @@ export const readTool: Tool = {
     const stat = fs.statSync(abs);
     if (stat.isDirectory()) {
       return { content: `Error: ${rel} is a directory, not a file.`, isError: true };
+    }
+
+    // PDFs are binary — extract their text instead of dumping raw bytes.
+    if (isPdf(abs)) {
+      const result = await extractPdfText(abs);
+      if (!result.ok) {
+        return { content: `Error: could not read PDF ${rel}: ${result.error}`, isError: true };
+      }
+      const header = `[Extracted text from PDF: ${rel} · ${result.pages} page(s)${result.truncated ? " · truncated" : ""}]\n\n`;
+      return {
+        content: header + result.text,
+        summary: `Read PDF ${rel} (${result.pages} pages)`,
+      };
+    }
+
+    // Guard other binary formats (.docx, .zip, images, …) from being dumped as mojibake.
+    if (isProbablyBinaryFile(abs)) {
+      return {
+        content: `Error: ${rel} appears to be a binary file (${(stat.size / 1024).toFixed(0)} KB) and can't be read as text.`,
+        isError: true,
+      };
     }
 
     const raw = fs.readFileSync(abs, "utf8");
